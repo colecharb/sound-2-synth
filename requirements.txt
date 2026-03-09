@@ -1,0 +1,4 @@
+torch
+soundfile
+sounddevice
+numpy<2
