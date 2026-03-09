@@ -1,0 +1,7 @@
+.zed/
+.venv/
+__pycache__/
+
+PROJECT_OVERVIEW.md
+
+output.wav
