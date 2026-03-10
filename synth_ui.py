@@ -13,33 +13,28 @@ Controls:
     Q           : Quit
 """
 
-import threading
 import queue
-from dataclasses import dataclass, asdict
+import threading
+from dataclasses import asdict, dataclass
 from typing import Optional
+
 import numpy as np
 import sounddevice as sd
-from textual.app import ComposeResult, RenderableType
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Static, Input, Label, Button
-from textual.widgets._input import Input as InputWidget
-from textual.reactive import reactive
-from textual.binding import Binding
-from textual import work
-from textual.app import App
-from textual.events import Key
-import torch
-import asyncio
-import time
 from pynput import keyboard
-import math
+from textual.app import App, ComposeResult, RenderableType
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+from textual.events import Key
+from textual.reactive import reactive
+from textual.widgets import Button, Input, Label, Static
+from textual.widgets._input import Input as InputWidget
 
 from synth import FMSynth
 
 
 class NonFocusableButton(Button):
     """A button that cannot be focused via Tab or arrow keys."""
-    
+
     def __init__(self, label: str, **kwargs):
         super().__init__(label, **kwargs)
         self.can_focus = False
@@ -47,62 +42,71 @@ class NonFocusableButton(Button):
 
 class KeyboardWidget(Static):
     """A visual piano keyboard widget with key press feedback."""
-    
+
     # Key mapping: char -> (note_name, octave_offset)
     # S is C4 (middle C), L is C5 (next octave)
     KEY_MAP = {
-        's': ('C', 0),
-        'd': ('D', 0),
-        'f': ('E', 0),
-        'g': ('F', 0),
-        'h': ('G', 0),
-        'j': ('A', 0),
-        'k': ('B', 0),
-        'l': ('C', 1),  # C5 (next octave - +1)
-        
-        'e': ('C#', 0),
-        'r': ('D#', 0),
-        'y': ('F#', 0),
-        'u': ('G#', 0),
-        'i': ('A#', 0),
+        "s": ("C", 0),
+        "d": ("D", 0),
+        "f": ("E", 0),
+        "g": ("F", 0),
+        "h": ("G", 0),
+        "j": ("A", 0),
+        "k": ("B", 0),
+        "l": ("C", 1),  # C5 (next octave - +1)
+        "e": ("C#", 0),
+        "r": ("D#", 0),
+        "y": ("F#", 0),
+        "u": ("G#", 0),
+        "i": ("A#", 0),
     }
-    
+
     # Note to semitone offset from C
     NOTE_SEMITONES = {
-        'C': 0, 'C#': 1, 'D': 2, 'D#': 3, 'E': 4, 'F': 5,
-        'F#': 6, 'G': 7, 'G#': 8, 'A': 9, 'A#': 10, 'B': 11
+        "C": 0,
+        "C#": 1,
+        "D": 2,
+        "D#": 3,
+        "E": 4,
+        "F": 5,
+        "F#": 6,
+        "G": 7,
+        "G#": 8,
+        "A": 9,
+        "A#": 10,
+        "B": 11,
     }
-    
+
     def __init__(self, audio_manager, **kwargs):
         super().__init__(**kwargs)
         self.audio_manager = audio_manager
         self.octave = 4  # Middle octave
         self.pressed_keys = set()  # Track which keys are currently held
         self.can_focus = False
-    
+
     def get_frequency(self, note_name: str, octave: int) -> float:
         """Calculate frequency for a given note and octave."""
         # A4 (octave 4) = 440 Hz
-        semitones_from_a4 = self.NOTE_SEMITONES[note_name] - self.NOTE_SEMITONES['A']
+        semitones_from_a4 = self.NOTE_SEMITONES[note_name] - self.NOTE_SEMITONES["A"]
         semitones_from_a4 += (octave - 4) * 12
         return 440.0 * (2.0 ** (semitones_from_a4 / 12.0))
-    
+
     def render(self) -> str:
         """Render the keyboard with visual feedback."""
         # Build keyboard display
         lines = []
         lines.append(f"[bold cyan]Keyboard (Octave {self.octave})[/bold cyan]")
         lines.append("")
-        
+
         # Black keys row (C# D# _ F# G# A# _)
         black_row = ""
         black_positions = [
-            ('e', 'C#'),
-            ('r', 'D#'),
+            ("e", "C#"),
+            ("r", "D#"),
             None,
-            ('y', 'F#'),
-            ('u', 'G#'),
-            ('i', 'A#'),
+            ("y", "F#"),
+            ("u", "G#"),
+            ("i", "A#"),
             None,
         ]
         for item in black_positions:
@@ -116,18 +120,18 @@ class KeyboardWidget(Static):
             else:
                 black_row += "  "
         lines.append(black_row)
-        
+
         # White keys row (C D E F G A B | C)
         white_row = ""
         white_keys = [
-            ('s', 'C'),
-            ('d', 'D'),
-            ('f', 'E'),
-            ('g', 'F'),
-            ('h', 'G'),
-            ('j', 'A'),
-            ('k', 'B'),
-            ('l', 'C↑'),  # C in next octave
+            ("s", "C"),
+            ("d", "D"),
+            ("f", "E"),
+            ("g", "F"),
+            ("h", "G"),
+            ("j", "A"),
+            ("k", "B"),
+            ("l", "C↑"),  # C in next octave
         ]
         for key_char, note_name in white_keys:
             is_pressed = key_char in self.pressed_keys
@@ -136,14 +140,16 @@ class KeyboardWidget(Static):
             else:
                 white_row += f"[white on dark_gray]{note_name:^3}[/white on dark_gray]"
         lines.append(white_row)
-        
+
         # Controls info
         lines.append("")
         lines.append("[dim]Keys:[/dim] S D F G H J K L (white) | E R Y U I (black)")
-        lines.append(f"[dim]Octave:[/dim] [cyan][{self.octave}][/cyan] [yellow]+ / - [/yellow] to change")
-        
+        lines.append(
+            f"[dim]Octave:[/dim] [cyan][{self.octave}][/cyan] [yellow]+ / - [/yellow] to change"
+        )
+
         return "\n".join(lines)
-    
+
     def key_pressed(self, key_char: str):
         """Called when a key is pressed."""
         if key_char.lower() in self.KEY_MAP:
@@ -153,7 +159,7 @@ class KeyboardWidget(Static):
             self.audio_manager.set_carrier_freq(freq)
             self.audio_manager.set_gate(True)
             self.refresh()
-    
+
     def key_released(self, key_char: str):
         """Called when a key is released."""
         if key_char.lower() in self.KEY_MAP:
@@ -168,7 +174,7 @@ class KeyboardWidget(Static):
                 freq = self.get_frequency(note_name, self.octave + octave_offset)
                 self.audio_manager.set_carrier_freq(freq)
             self.refresh()
-    
+
     def change_octave(self, delta: int):
         """Change the octave."""
         self.octave = max(0, min(8, self.octave + delta))
@@ -184,6 +190,7 @@ class KeyboardWidget(Static):
 @dataclass
 class SynthParameters:
     """Container for all synth parameters."""
+
     carrier_freq: float = 440.0
     mod_ratio: float = 2.0
     mod_index: float = 5.0
@@ -258,13 +265,13 @@ PARAM_RANGES = {
 
 # Step sizes for parameter adjustments (in actual parameter units)
 PARAM_STEPS = {
-    "carrier_freq": 10.0,   # Hz
-    "mod_ratio": 0.1,       # Fine control for mod_ratio
-    "mod_index": 0.5,       # 
-    "attack": 0.01,         # seconds
-    "decay": 0.01,          # seconds
-    "sustain": 0.05,        # 0-1 range
-    "release": 0.01,        # seconds
+    "carrier_freq": 10.0,  # Hz
+    "mod_ratio": 0.1,  # Fine control for mod_ratio
+    "mod_index": 0.5,  #
+    "attack": 0.01,  # seconds
+    "decay": 0.01,  # seconds
+    "sustain": 0.05,  # 0-1 range
+    "release": 0.01,  # seconds
 }
 
 
@@ -283,7 +290,7 @@ class AudioManager:
         self.gate_open = False
         self.time_offset = 0.0
         self.gate_release_time: Optional[float] = -1e6  # Start fully released (silent)
-        
+
         # Keyboard note control
         self.keyboard_freq: Optional[float] = None
 
@@ -308,7 +315,7 @@ class AudioManager:
             # Gate just closed - enter release phase
             self.gate_open = False
             self.gate_release_time = self.time_offset
-    
+
     def set_carrier_freq(self, freq: float):
         """Set carrier frequency for keyboard notes."""
         with self.params_lock:
@@ -379,7 +386,14 @@ class ParameterSlider(Static):
 
     value = reactive(0.5)
 
-    def __init__(self, param_name: str, min_val: float, max_val: float, initial: float, slider_id: Optional[str] = None):
+    def __init__(
+        self,
+        param_name: str,
+        min_val: float,
+        max_val: float,
+        initial: float,
+        slider_id: Optional[str] = None,
+    ):
         super().__init__(id=slider_id)
         self.param_name = param_name
         self.min_val = min_val
@@ -393,7 +407,7 @@ class ParameterSlider(Static):
         self.refresh()
         # Post a message up to parent to trigger parameter update
         try:
-            if hasattr(self.app, 'on_slider_change'):
+            if hasattr(self.app, "on_slider_change"):
                 self.app.on_slider_change()
         except Exception:
             # Ignore errors when app context is not available (e.g., during testing)
@@ -571,14 +585,18 @@ class SynthUI(App):
             # Right: Info panel and keyboard
             with Vertical(id="info-panel"):
                 yield Label("[bold yellow]PRESETS[/bold yellow]")
-                yield NonFocusableButton("1: Default", id="preset-default", variant="primary")
+                yield NonFocusableButton(
+                    "1: Default", id="preset-default", variant="primary"
+                )
                 yield NonFocusableButton("2: Bell", id="preset-bell")
                 yield NonFocusableButton("3: Bass", id="preset-bass")
                 yield NonFocusableButton("4: Brass", id="preset-brass")
                 yield NonFocusableButton("5: Noise", id="preset-noise")
                 yield Label("")
                 yield Label("[bold cyan]GATE CONTROL[/bold cyan]")
-                yield NonFocusableButton("▶ PLAY (Space)", id="gate-play", variant="success")
+                yield NonFocusableButton(
+                    "▶ PLAY (Space)", id="gate-play", variant="success"
+                )
                 yield NonFocusableButton("■ STOP", id="gate-stop", variant="error")
                 yield Label("[red]IDLE[/red]", id="gate-status")
                 yield Label("")
@@ -626,6 +644,7 @@ class SynthUI(App):
 
     def _start_key_listener(self) -> None:
         """Start global keyboard listener for spacebar and note keys."""
+
         def on_press(key):
             try:
                 # Handle spacebar for gate
@@ -635,15 +654,15 @@ class SynthUI(App):
                         self.gate_is_open = True
                         self.audio_manager.set_gate(True)
                         self.update_gate_status()
-                
+
                 # Handle note keys and octave changes
-                elif hasattr(key, 'char') and key.char is not None:
+                elif hasattr(key, "char") and key.char is not None:
                     char = key.char
                     # Octave up/down
-                    if char == '+' or char == '=':
+                    if char == "+" or char == "=":
                         if self.keyboard_widget:
                             self.keyboard_widget.change_octave(1)
-                    elif char == '-' or char == '_':
+                    elif char == "-" or char == "_":
                         if self.keyboard_widget:
                             self.keyboard_widget.change_octave(-1)
                     # Note keys
@@ -662,11 +681,11 @@ class SynthUI(App):
                         self.gate_is_open = False
                         self.audio_manager.set_gate(False)
                         self.update_gate_status()
-                
+
                 # Handle note keys
-                elif hasattr(key, 'char') and key.char is not None:
+                elif hasattr(key, "char") and key.char is not None:
                     char = key.char
-                    if char not in ['+', '=', '-', '_']:
+                    if char not in ["+", "=", "-", "_"]:
                         if self.keyboard_widget:
                             self.keyboard_widget.key_released(char)
             except AttributeError:
@@ -677,10 +696,8 @@ class SynthUI(App):
 
     def _stop_key_listener(self) -> None:
         """Stop global keyboard listener."""
-        if hasattr(self, '_listener') and self._listener is not None:
+        if hasattr(self, "_listener") and self._listener is not None:
             self._listener.stop()
-
-
 
     def action_adjust_slider(self, delta: float) -> None:
         """Adjust the currently focused slider."""
@@ -697,10 +714,10 @@ class SynthUI(App):
         """Focus the next slider in the list."""
         if not self.sliders:
             return
-        
+
         slider_list = list(self.sliders.values())
         current = self.focused
-        
+
         # Find current slider index
         try:
             current_index = slider_list.index(current)
@@ -708,17 +725,17 @@ class SynthUI(App):
         except (ValueError, TypeError):
             # Current is not a slider, focus the first one
             next_index = 0
-        
+
         slider_list[next_index].focus()
 
     def action_focus_prev_slider(self) -> None:
         """Focus the previous slider in the list."""
         if not self.sliders:
             return
-        
+
         slider_list = list(self.sliders.values())
         current = self.focused
-        
+
         # Find current slider index
         try:
             current_index = slider_list.index(current)
@@ -726,7 +743,7 @@ class SynthUI(App):
         except (ValueError, TypeError):
             # Current is not a slider, focus the last one
             prev_index = len(slider_list) - 1
-        
+
         slider_list[prev_index].focus()
 
     def on_button_pressed(self, event) -> None:
@@ -767,6 +784,10 @@ class SynthUI(App):
         params = SynthParameters()
         for param_name, slider in self.sliders.items():
             setattr(params, param_name, slider.get_value())
+
+        # If keyboard keys are held, preserve the keyboard frequency
+        if self.keyboard_widget and self.keyboard_widget.pressed_keys:
+            params.carrier_freq = self.audio_manager.params.carrier_freq
 
         # Update audio manager
         self.audio_manager.set_parameters(params)
