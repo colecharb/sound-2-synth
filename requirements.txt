@@ -2,3 +2,5 @@ torch
 soundfile
 sounddevice
 numpy<2
+textual
+pynput
