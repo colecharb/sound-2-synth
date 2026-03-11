@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
 from torch.utils.data import TensorDataset, DataLoader
+from tqdm import tqdm
 
 from model import ParameterPredictor
 from loss import create_spectral_loss
@@ -90,7 +91,8 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     
-    for batch_idx, (embeddings, target_params) in enumerate(train_loader):
+    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Training", leave=False)
+    for batch_idx, (embeddings, target_params) in pbar:
         embeddings = embeddings.to(device)
         target_params = target_params.to(device)
         
@@ -102,34 +104,34 @@ def train_epoch(
         predicted_audio_list = []
         
         for i in range(target_params.shape[0]):
-            # Target audio
+            # Target audio — no grad needed, targets are fixed
             with torch.no_grad():
                 target_audio = synth.forward(
-                    carrier_freq=float(target_params[i, 0]),
-                    mod_ratio=float(target_params[i, 1]),
-                    mod_index=float(target_params[i, 2]),
-                    attack=float(target_params[i, 3]),
-                    decay=float(target_params[i, 4]),
-                    sustain=float(target_params[i, 5]),
-                    release=float(target_params[i, 6]),
-                    note_duration=float(target_params[i, 7]),
-                    lowpass_freq=float(target_params[i, 8]),
-                    highpass_freq=float(target_params[i, 9]),
+                    carrier_freq=target_params[i, 0],
+                    mod_ratio=target_params[i, 1],
+                    mod_index=target_params[i, 2],
+                    attack=target_params[i, 3],
+                    decay=target_params[i, 4],
+                    sustain=target_params[i, 5],
+                    release=target_params[i, 6],
+                    note_duration=target_params[i, 7],
+                    lowpass_freq=target_params[i, 8],
+                    highpass_freq=target_params[i, 9],
                 )
             target_audio_list.append(target_audio)
-            
-            # Predicted audio
+
+            # Predicted audio — pass tensors directly to keep the grad graph intact
             predicted_audio = synth.forward(
-                carrier_freq=float(predicted_params[i, 0]),
-                mod_ratio=float(predicted_params[i, 1]),
-                mod_index=float(predicted_params[i, 2]),
-                attack=float(predicted_params[i, 3]),
-                decay=float(predicted_params[i, 4]),
-                sustain=float(predicted_params[i, 5]),
-                release=float(predicted_params[i, 6]),
-                note_duration=float(predicted_params[i, 7]),
-                lowpass_freq=float(predicted_params[i, 8]),
-                highpass_freq=float(predicted_params[i, 9]),
+                carrier_freq=predicted_params[i, 0],
+                mod_ratio=predicted_params[i, 1],
+                mod_index=predicted_params[i, 2],
+                attack=predicted_params[i, 3],
+                decay=predicted_params[i, 4],
+                sustain=predicted_params[i, 5],
+                release=predicted_params[i, 6],
+                note_duration=predicted_params[i, 7],
+                lowpass_freq=predicted_params[i, 8],
+                highpass_freq=predicted_params[i, 9],
             )
             predicted_audio_list.append(predicted_audio)
         
@@ -156,6 +158,8 @@ def train_epoch(
         optimizer.step()
         
         total_loss += loss.item()
+        avg_loss = total_loss / (batch_idx + 1)
+        pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
     
     return total_loss / len(train_loader)
 
@@ -177,8 +181,9 @@ def validate(
     model.eval()
     total_loss = 0.0
     
+    pbar = tqdm(val_loader, desc="Validating", leave=False)
     with torch.no_grad():
-        for embeddings, target_params in val_loader:
+        for batch_idx, (embeddings, target_params) in enumerate(pbar):
             embeddings = embeddings.to(device)
             target_params = target_params.to(device)
             
@@ -191,30 +196,30 @@ def validate(
             
             for i in range(target_params.shape[0]):
                 target_audio = synth.forward(
-                    carrier_freq=float(target_params[i, 0]),
-                    mod_ratio=float(target_params[i, 1]),
-                    mod_index=float(target_params[i, 2]),
-                    attack=float(target_params[i, 3]),
-                    decay=float(target_params[i, 4]),
-                    sustain=float(target_params[i, 5]),
-                    release=float(target_params[i, 6]),
-                    note_duration=float(target_params[i, 7]),
-                    lowpass_freq=float(target_params[i, 8]),
-                    highpass_freq=float(target_params[i, 9]),
+                    carrier_freq=target_params[i, 0],
+                    mod_ratio=target_params[i, 1],
+                    mod_index=target_params[i, 2],
+                    attack=target_params[i, 3],
+                    decay=target_params[i, 4],
+                    sustain=target_params[i, 5],
+                    release=target_params[i, 6],
+                    note_duration=target_params[i, 7],
+                    lowpass_freq=target_params[i, 8],
+                    highpass_freq=target_params[i, 9],
                 )
                 target_audio_list.append(target_audio)
-                
+
                 predicted_audio = synth.forward(
-                    carrier_freq=float(predicted_params[i, 0]),
-                    mod_ratio=float(predicted_params[i, 1]),
-                    mod_index=float(predicted_params[i, 2]),
-                    attack=float(predicted_params[i, 3]),
-                    decay=float(predicted_params[i, 4]),
-                    sustain=float(predicted_params[i, 5]),
-                    release=float(predicted_params[i, 6]),
-                    note_duration=float(predicted_params[i, 7]),
-                    lowpass_freq=float(predicted_params[i, 8]),
-                    highpass_freq=float(predicted_params[i, 9]),
+                    carrier_freq=predicted_params[i, 0],
+                    mod_ratio=predicted_params[i, 1],
+                    mod_index=predicted_params[i, 2],
+                    attack=predicted_params[i, 3],
+                    decay=predicted_params[i, 4],
+                    sustain=predicted_params[i, 5],
+                    release=predicted_params[i, 6],
+                    note_duration=predicted_params[i, 7],
+                    lowpass_freq=predicted_params[i, 8],
+                    highpass_freq=predicted_params[i, 9],
                 )
                 predicted_audio_list.append(predicted_audio)
             
@@ -234,6 +239,8 @@ def validate(
             
             loss = spectral_loss_fn(target_audio_batch, predicted_audio_batch)
             total_loss += loss.item()
+            avg_loss = total_loss / (batch_idx + 1)
+            pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
     
     return total_loss / len(val_loader)
 
