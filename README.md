@@ -2,6 +2,13 @@
 
 Extract FM synthesizer parameters from arbitrary audio using machine learning.
 
+## Installation
+
+```bash
+pip install --only-binary :all: torch soundfile sounddevice numpy textual pynput librosa==0.10.0
+pip install openl3
+```
+
 ## Quick Start
 
 ### Option 1: Use the Live Synthesizer
