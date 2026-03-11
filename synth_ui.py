@@ -190,7 +190,6 @@ class KeyboardWidget(Static):
 @dataclass
 class SynthParameters:
     """Container for all synth parameters."""
-
     carrier_freq: float = 440.0
     mod_ratio: float = 2.0
     mod_index: float = 5.0
@@ -198,6 +197,8 @@ class SynthParameters:
     decay: float = 0.1
     sustain: float = 0.7
     release: float = 0.3
+    lowpass_freq: float = 20000.0
+    highpass_freq: float = 20.0
 
     def to_dict(self):
         return asdict(self)
@@ -213,6 +214,8 @@ PRESETS = {
         decay=0.1,
         sustain=0.7,
         release=0.3,
+        lowpass_freq=20000.0,
+        highpass_freq=20.0,
     ),
     "bell": SynthParameters(
         carrier_freq=880.0,
@@ -222,6 +225,8 @@ PRESETS = {
         decay=0.3,
         sustain=0.5,
         release=0.5,
+        lowpass_freq=20000.0,
+        highpass_freq=20.0,
     ),
     "bass": SynthParameters(
         carrier_freq=55.0,
@@ -231,6 +236,8 @@ PRESETS = {
         decay=0.1,
         sustain=0.8,
         release=0.2,
+        lowpass_freq=200.0,
+        highpass_freq=20.0,
     ),
     "brass": SynthParameters(
         carrier_freq=220.0,
@@ -240,6 +247,8 @@ PRESETS = {
         decay=0.15,
         sustain=0.9,
         release=0.4,
+        lowpass_freq=20000.0,
+        highpass_freq=20.0,
     ),
     "noise": SynthParameters(
         carrier_freq=200.0,
@@ -249,6 +258,8 @@ PRESETS = {
         decay=0.05,
         sustain=0.6,
         release=0.2,
+        lowpass_freq=8000.0,
+        highpass_freq=20.0,
     ),
 }
 
@@ -261,17 +272,21 @@ PARAM_RANGES = {
     "decay": (0.001, 2.0),
     "sustain": (0.0, 1.0),
     "release": (0.001, 2.0),
+    "lowpass_freq": (20.0, 20000.0),
+    "highpass_freq": (20.0, 10000.0),
 }
 
 # Step sizes for parameter adjustments (in actual parameter units)
 PARAM_STEPS = {
-    "carrier_freq": 10.0,  # Hz
-    "mod_ratio": 0.1,  # Fine control for mod_ratio
-    "mod_index": 0.5,  #
-    "attack": 0.01,  # seconds
-    "decay": 0.01,  # seconds
-    "sustain": 0.05,  # 0-1 range
-    "release": 0.01,  # seconds
+    "carrier_freq": 10.0,   # Hz
+    "mod_ratio": 0.1,       # Fine control for mod_ratio
+    "mod_index": 0.5,       # 
+    "attack": 0.01,         # seconds
+    "decay": 0.01,          # seconds
+    "sustain": 0.05,        # 0-1 range
+    "release": 0.01,        # seconds
+    "lowpass_freq": 200.0,  # Hz
+    "highpass_freq": 50.0,  # Hz
 }
 
 
@@ -327,35 +342,47 @@ class AudioManager:
         if status:
             print(f"Audio callback status: {status}")
 
+        # Quick parameter snapshot - minimize lock time
         with self.params_lock:
-            params = SynthParameters(**asdict(self.params))
+            carrier_freq = self.params.carrier_freq
+            mod_ratio = self.params.mod_ratio
+            mod_index = self.params.mod_index
+            attack = self.params.attack
+            decay = self.params.decay
+            sustain = self.params.sustain
+            release = self.params.release
+            lowpass_freq = self.params.lowpass_freq
+            highpass_freq = self.params.highpass_freq
 
         # Generate chunk
         duration = frames / self.sample_rate
         chunk = self.synth.generate_chunk(
             duration=duration,
             time_offset=self.time_offset,
-            carrier_freq=params.carrier_freq,
-            mod_ratio=params.mod_ratio,
-            mod_index=params.mod_index,
-            attack=params.attack,
-            decay=params.decay,
-            sustain=params.sustain,
-            release=params.release,
+            carrier_freq=carrier_freq,
+            mod_ratio=mod_ratio,
+            mod_index=mod_index,
+            attack=attack,
+            decay=decay,
+            sustain=sustain,
+            release=release,
             gate_open=self.gate_open,
             gate_release_time=self.gate_release_time,
+            lowpass_freq=lowpass_freq,
+            highpass_freq=highpass_freq,
         )
 
-        # Convert to numpy
-        chunk_np = chunk.numpy().astype(np.float32)
+        # Direct conversion to numpy float32 - avoid intermediate copy
+        chunk_np = chunk.detach().numpy().astype(np.float32)
 
         # Handle size mismatch (shouldn't happen, but be safe)
-        if len(chunk_np) < frames:
-            chunk_np = np.pad(chunk_np, (0, frames - len(chunk_np)))
-        elif len(chunk_np) > frames:
-            chunk_np = chunk_np[:frames]
+        if len(chunk_np) != frames:
+            if len(chunk_np) < frames:
+                chunk_np = np.pad(chunk_np, (0, frames - len(chunk_np)))
+            else:
+                chunk_np = chunk_np[:frames]
 
-        outdata[:] = chunk_np.reshape(-1, 1)
+        outdata[:, 0] = chunk_np
         self.time_offset += duration
 
     def start(self):
@@ -398,7 +425,20 @@ class ParameterSlider(Static):
         self.param_name = param_name
         self.min_val = min_val
         self.max_val = max_val
-        self.value = (initial - min_val) / (max_val - min_val)
+        
+        # Use logarithmic scaling for frequency parameters
+        self.use_log_scale = param_name in ("lowpass_freq", "highpass_freq")
+        
+        if self.use_log_scale:
+            # For log scale: value is 0-1, maps to log(min) to log(max)
+            import math
+            self.log_min = math.log(min_val)
+            self.log_max = math.log(max_val)
+            self.value = (math.log(initial) - self.log_min) / (self.log_max - self.log_min)
+        else:
+            # Linear scale
+            self.value = (initial - min_val) / (max_val - min_val)
+        
         self.can_focus = True  # Enable focus for this widget
 
     def watch_value(self, old_value: float, new_value: float) -> None:
@@ -419,8 +459,12 @@ class ParameterSlider(Static):
         filled = int(self.value * bar_width)
         bar = "█" * filled + "░" * (bar_width - filled)
 
-        # Calculate actual value
-        actual_value = self.min_val + self.value * (self.max_val - self.min_val)
+        # Calculate actual value based on scale type
+        if self.use_log_scale:
+            import math
+            actual_value = math.exp(self.log_min + self.value * (self.log_max - self.log_min))
+        else:
+            actual_value = self.min_val + self.value * (self.max_val - self.min_val)
 
         # Show if focused
         focused_indicator = " ◄ FOCUSED" if self.has_focus else ""
@@ -428,30 +472,62 @@ class ParameterSlider(Static):
 
     def get_value(self) -> float:
         """Get the actual parameter value."""
-        return self.min_val + self.value * (self.max_val - self.min_val)
+        if self.use_log_scale:
+            import math
+            return math.exp(self.log_min + self.value * (self.log_max - self.log_min))
+        else:
+            return self.min_val + self.value * (self.max_val - self.min_val)
 
     def set_value(self, actual_value: float):
         """Set the slider from an actual parameter value."""
         actual_value = max(self.min_val, min(self.max_val, actual_value))
-        self.value = (actual_value - self.min_val) / (self.max_val - self.min_val)
+        if self.use_log_scale:
+            import math
+            self.value = (math.log(actual_value) - self.log_min) / (self.log_max - self.log_min)
+        else:
+            self.value = (actual_value - self.min_val) / (self.max_val - self.min_val)
 
     def increment(self, delta: Optional[float] = None):
         """Increment the slider value by the parameter's step size."""
         if delta is None:
-            # Use parameter-specific step size
-            step = PARAM_STEPS.get(self.param_name, 0.01)
-            # Convert actual parameter step to normalized slider step
-            delta = step / (self.max_val - self.min_val)
+            if self.use_log_scale:
+                # For log scale, use multiplicative stepping
+                import math
+                multiplier = 1.2  # 20% increase per step
+                current_freq = self.get_value()
+                new_freq = current_freq * multiplier
+                new_freq = max(self.min_val, min(self.max_val, new_freq))
+                new_normalized = (math.log(new_freq) - self.log_min) / (self.log_max - self.log_min)
+                delta = new_normalized - self.value
+            else:
+                # Linear scale
+                step = PARAM_STEPS.get(self.param_name, 0.01)
+                delta = step / (self.max_val - self.min_val)
+        
         self.value = max(0.0, min(1.0, self.value + delta))
 
     def decrement(self, delta: Optional[float] = None):
         """Decrement the slider value by the parameter's step size."""
         if delta is None:
-            # Use parameter-specific step size
-            step = PARAM_STEPS.get(self.param_name, 0.01)
-            # Convert actual parameter step to normalized slider step
-            delta = step / (self.max_val - self.min_val)
-        self.value = max(0.0, min(1.0, self.value - delta))
+            if self.use_log_scale:
+                # For log scale, use multiplicative stepping
+                import math
+                multiplier = 1.0 / 1.2  # Inverse of increment (~83.3%)
+                current_freq = self.get_value()
+                new_freq = current_freq * multiplier
+                new_freq = max(self.min_val, min(self.max_val, new_freq))
+                new_normalized = (math.log(new_freq) - self.log_min) / (self.log_max - self.log_min)
+                delta = new_normalized - self.value
+                # delta is already negative for decrement, just add it
+                self.value = max(0.0, min(1.0, self.value + delta))
+            else:
+                # Linear scale
+                step = PARAM_STEPS.get(self.param_name, 0.01)
+                delta = step / (self.max_val - self.min_val)
+                self.value = max(0.0, min(1.0, self.value - delta))
+        else:
+            # When delta is explicitly provided, subtract it
+            self.value = max(0.0, min(1.0, self.value - delta))
 
     def on_key(self, event: Key) -> None:
         """Handle keyboard input when slider is focused."""
@@ -487,6 +563,7 @@ class SynthUI(App):
         Binding("3", "load_preset('bass')", "Preset 3", show=False),
         Binding("4", "load_preset('brass')", "Preset 4", show=False),
         Binding("5", "load_preset('noise')", "Preset 5", show=False),
+        Binding("e", "export_note()", "Export", show=True),
     ]
 
     CSS = """
@@ -568,6 +645,8 @@ class SynthUI(App):
             "decay",
             "sustain",
             "release",
+            "lowpass_freq",
+            "highpass_freq",
         ]
 
     def compose(self) -> ComposeResult:
@@ -593,6 +672,9 @@ class SynthUI(App):
                 yield NonFocusableButton("4: Brass", id="preset-brass")
                 yield NonFocusableButton("5: Noise", id="preset-noise")
                 yield Label("")
+                yield Label("[bold cyan]EXPORT[/bold cyan]")
+                yield NonFocusableButton("E: Export Note", id="export-note", variant="warning")
+                yield Label("")
                 yield Label("[bold cyan]GATE CONTROL[/bold cyan]")
                 yield NonFocusableButton(
                     "▶ PLAY (Space)", id="gate-play", variant="success"
@@ -607,7 +689,7 @@ class SynthUI(App):
                 yield KeyboardWidget(self.audio_manager, id="keyboard")
 
         yield Static(
-            "[dim]SPACE[/dim] Toggle Gate  |  [dim]1-5[/dim] Presets  |  [dim]↑/↓[/dim] Adjust  |  [dim]Q[/dim] Quit  |  [dim]S-L[/dim] Play Keys",
+            "[dim]SPACE[/dim] Gate  |  [dim]1-5[/dim] Presets  |  [dim]E[/dim] Export  |  [dim]↑/↓[/dim] Adjust  |  [dim]Q[/dim] Quit  |  [dim]S-L[/dim] Keys",
             id="footer",
         )
 
@@ -777,6 +859,50 @@ class SynthUI(App):
 
         self.on_slider_change()
         self.notify(f"Loaded preset: {preset_name}")
+
+    def action_export_note(self) -> None:
+        """Export current synth settings as a WAV file."""
+        import soundfile as sf
+        from datetime import datetime
+        import os
+        
+        # Get current parameters
+        params = SynthParameters()
+        for param_name, slider in self.sliders.items():
+            setattr(params, param_name, slider.get_value())
+        
+        # Generate a 2-second note
+        duration = 2.0
+        chunk = self.audio_manager.synth.generate_chunk(
+            duration=duration,
+            time_offset=0.0,
+            carrier_freq=params.carrier_freq,
+            mod_ratio=params.mod_ratio,
+            mod_index=params.mod_index,
+            attack=params.attack,
+            decay=params.decay,
+            sustain=params.sustain,
+            release=params.release,
+            gate_open=True,
+            gate_release_time=params.attack + params.decay + 1.0,
+            lowpass_freq=params.lowpass_freq,
+            highpass_freq=params.highpass_freq,
+        )
+        
+        # Convert to numpy
+        audio = chunk.numpy().astype(np.float32)
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"synth_export_{timestamp}.wav"
+        filepath = os.path.abspath(filename)
+        
+        try:
+            # Write WAV file using soundfile
+            sf.write(filename, audio, self.audio_manager.sample_rate)
+            self.notify(f"Saved: {filepath}", timeout=5.0)
+        except Exception as e:
+            self.notify(f"Export failed: {e}", timeout=3.0)
 
     def on_slider_change(self) -> None:
         """Called when any slider changes."""
