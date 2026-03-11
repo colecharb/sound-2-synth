@@ -322,10 +322,12 @@ class AudioManager:
     def set_gate(self, open: bool):
         """Set gate state (True = gate open/playing, False = gate closed/release)."""
         if open and not self.gate_open:
-            # Gate just opened
+            # Gate just opened - new note starts
             self.gate_open = True
             self.gate_release_time = None
             self.time_offset = 0.0
+            # Reset filter state for clean note start
+            self.synth.reset_filter_state()
         elif not open and self.gate_open:
             # Gate just closed - enter release phase
             self.gate_open = False

@@ -45,6 +45,12 @@ class FMSynth(nn.Module):
         self.lowpass_state = 0.0
         self.highpass_state = 0.0
         self.highpass_prev_sample = 0.0
+    
+    def reset_filter_state(self) -> None:
+        """Reset filter states for a new note."""
+        self.lowpass_state = 0.0
+        self.highpass_state = 0.0
+        self.highpass_prev_sample = 0.0
 
     def forward(
         self,
