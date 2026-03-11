@@ -4,3 +4,7 @@ sounddevice
 numpy<2
 textual
 pynput
+
+# Training pipeline dependencies (heavy: openl3 pulls in TensorFlow)
+openl3
+librosa
