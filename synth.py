@@ -62,6 +62,8 @@ class FMSynth(nn.Module):
         sustain: float | torch.Tensor = 0.7,
         release: float | torch.Tensor = 0.3,
         note_duration: float | torch.Tensor = 1.0,
+        lowpass_freq: float | torch.Tensor = 20000.0,
+        highpass_freq: float | torch.Tensor = 20.0,
     ) -> torch.Tensor:
         """
         Render one note as a 1-D float32 tensor.
@@ -77,6 +79,8 @@ class FMSynth(nn.Module):
         release        : Release time in seconds.
         note_duration  : Time in seconds the note is held at sustain level
                          (between end of decay and start of release).
+        lowpass_freq   : Low-pass filter cutoff frequency in Hz (default 20000 = no filtering).
+        highpass_freq  : High-pass filter cutoff frequency in Hz (default 20 = minimal filtering).
 
         Returns
         -------
@@ -114,6 +118,11 @@ class FMSynth(nn.Module):
         carrier   = torch.sin(2.0 * torch.pi * carrier_freq * t + modulator)
 
         audio = env * carrier
+
+        # Apply filters with fresh state (offline rendering, not chunked)
+        self.reset_filter_state()
+        audio = self._apply_highpass_filter(audio, float(highpass_freq))
+        audio = self._apply_lowpass_filter(audio, float(lowpass_freq))
 
         # Peak-normalise (avoid silence edge case)
         peak = audio.abs().max()

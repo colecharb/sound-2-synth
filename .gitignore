@@ -5,3 +5,11 @@ __pycache__/
 PROJECT_OVERVIEW.md
 
 output.wav
+
+# Training data and checkpoints
+data/
+checkpoints/
+
+# Cached embeddings and large files
+*.pt
+*.pth
