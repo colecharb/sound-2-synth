@@ -19,6 +19,12 @@ ADSR envelope phases:
 
 import torch
 import torch.nn as nn
+import math
+
+
+# Helper functions - not JIT due to tuple return complexity
+# Instead, we'll inline these in the filter methods for better control
+# and use state variables in the FMSynth class
 
 
 class FMSynth(nn.Module):
@@ -34,6 +40,11 @@ class FMSynth(nn.Module):
     def __init__(self, sample_rate: int = 44100):
         super().__init__()
         self.sample_rate = sample_rate
+        
+        # IIR filter state for continuity across chunks
+        self.lowpass_state = 0.0
+        self.highpass_state = 0.0
+        self.highpass_prev_sample = 0.0
 
     def forward(
         self,
@@ -221,6 +232,91 @@ class FMSynth(nn.Module):
         )
         return env
 
+    def _apply_lowpass_filter(self, audio: torch.Tensor, cutoff_freq: float) -> torch.Tensor:
+        """
+        Apply a first-order low-pass filter with state continuity.
+        
+        Parameters
+        ----------
+        audio : torch.Tensor
+            Input audio samples.
+        cutoff_freq : float
+            Cutoff frequency in Hz.
+            
+        Returns
+        -------
+        torch.Tensor
+            Filtered audio.
+        """
+        if cutoff_freq <= 0 or cutoff_freq >= self.sample_rate / 2:
+            return audio
+        
+        wc = 2.0 * math.pi * cutoff_freq / self.sample_rate
+        alpha = wc / (wc + 1.0)
+        beta = 1.0 - alpha
+        
+        n = audio.shape[0]
+        if n == 0:
+            return audio
+        
+        # Simple loop-based IIR filter with state continuity
+        # y[i] = alpha * x[i] + beta * y[i-1]
+        filtered = torch.zeros_like(audio)
+        state = self.lowpass_state
+        
+        for i in range(n):
+            state = alpha * float(audio[i]) + beta * state
+            filtered[i] = state
+        
+        # Save final state for next chunk
+        self.lowpass_state = state
+        
+        return filtered
+    
+    def _apply_highpass_filter(self, audio: torch.Tensor, cutoff_freq: float) -> torch.Tensor:
+        """
+        Apply a first-order high-pass filter with state continuity.
+        
+        Parameters
+        ----------
+        audio : torch.Tensor
+            Input audio samples.
+        cutoff_freq : float
+            Cutoff frequency in Hz.
+            
+        Returns
+        -------
+        torch.Tensor
+            Filtered audio.
+        """
+        if cutoff_freq <= 0 or cutoff_freq >= self.sample_rate / 2:
+            return audio
+        
+        # First-order high-pass: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+        wc = 2.0 * math.pi * cutoff_freq / self.sample_rate
+        alpha = 1.0 / (wc + 1.0)
+        
+        n = audio.shape[0]
+        if n == 0:
+            return audio
+        
+        # Simple loop-based IIR filter with state continuity
+        filtered = torch.zeros_like(audio)
+        state = self.highpass_state
+        last_sample = self.highpass_prev_sample
+        
+        for i in range(n):
+            current_sample = float(audio[i])
+            state = alpha * (state + current_sample - last_sample)
+            filtered[i] = state
+            last_sample = current_sample
+        
+        # Save state for next chunk
+        self.highpass_state = state
+        self.highpass_prev_sample = last_sample
+        
+        return filtered
+
     def generate_chunk(
         self,
         duration: float,
@@ -234,6 +330,8 @@ class FMSynth(nn.Module):
         release: float | torch.Tensor = 0.3,
         gate_open: bool = True,
         gate_release_time: float | torch.Tensor | None = None,
+        lowpass_freq: float = 20000.0,
+        highpass_freq: float = 20.0,
     ) -> torch.Tensor:
         """
         Generate a short chunk of audio for streaming/real-time use.
@@ -262,53 +360,75 @@ class FMSynth(nn.Module):
             Whether the gate is currently open (True) or closed (False).
         gate_release_time : float | torch.Tensor, optional
             Time when gate was released. If None and gate_open=False, uses current time_offset.
+        lowpass_freq : float
+            Low-pass filter cutoff frequency in Hz (default 20000 = no filtering).
+        highpass_freq : float
+            High-pass filter cutoff frequency in Hz (default 20 = minimal filtering).
 
         Returns
         -------
         torch.Tensor
             Audio samples, shape (N,) normalized to approximately [-1, 1].
         """
-        def _t(x):
-            if isinstance(x, torch.Tensor):
-                return x.float()
-            return torch.tensor(float(x))
-
-        carrier_freq = _t(carrier_freq)
-        mod_ratio = _t(mod_ratio)
-        mod_index = _t(mod_index)
-        attack = _t(attack).clamp(min=1e-4)
-        decay = _t(decay).clamp(min=1e-4)
-        sustain = _t(sustain).clamp(0.0, 1.0)
-        release = _t(release).clamp(min=1e-4)
-        time_offset_scalar = float(time_offset)
-
         sr = self.sample_rate
         n_samples = int(duration * sr)
+        
+        # Fast path for scalars - avoid tensor conversion overhead
+        cf = float(carrier_freq)
+        mr = float(mod_ratio)
+        mi = float(mod_index)
+        att = max(float(attack), 1e-4)
+        dec = max(float(decay), 1e-4)
+        sus = min(max(float(sustain), 0.0), 1.0)
+        rel = max(float(release), 1e-4)
+        time_offset_scalar = float(time_offset)
 
-        # Time vector for this chunk
-        t = torch.linspace(
-            time_offset_scalar,
-            time_offset_scalar + duration,
-            n_samples,
+        # Arange instead of linspace for better performance
+        # t = time_offset + (arange / sr)
+        t = torch.arange(n_samples, dtype=torch.float32) / sr + time_offset_scalar
+
+        # Gate release time as scalar
+        gate_rel_time = 1e6 if gate_open else -1e6
+        if gate_release_time is not None:
+            gate_rel_time = float(gate_release_time)
+
+        # Build gated ADSR envelope (inlined for speed)
+        t_attack_end = att
+        t_decay_end = att + dec
+        
+        # Vectorized ADSR computation
+        attack_ramp = (t / att).clamp(0.0, 1.0)
+        decay_progress = ((t - t_attack_end) / dec).clamp(0.0, 1.0)
+        decay_ramp = 1.0 - (1.0 - sus) * decay_progress
+        
+        release_progress = ((t - gate_rel_time) / rel).clamp(0.0, 1.0)
+        release_ramp = sus * (1.0 - release_progress)
+        
+        in_attack  = (t <= t_attack_end).float()
+        in_decay   = ((t > t_attack_end) & (t <= t_decay_end)).float()
+        in_sustain = (t > t_decay_end) & (t <= gate_rel_time)
+        in_release = (t > gate_rel_time).float()
+        
+        env = (
+            in_attack  * attack_ramp
+            + in_decay * decay_ramp
+            + in_sustain.float() * sus
+            + in_release * release_ramp
         )
 
-        # Determine gate release time
-        if gate_release_time is None:
-            # If gate is open, set release time far in future (sustain indefinitely)
-            # If gate is closed, set release time far in past (fully released, silent)
-            gate_release_time = _t(1e6 if gate_open else -1e6)
-        else:
-            gate_release_time = _t(gate_release_time)
-
-        # Build gated ADSR envelope
-        env = self._adsr_gated(t, attack, decay, sustain, release, gate_release_time)
-
-        # FM synthesis
-        mod_freq = carrier_freq * mod_ratio
-        modulator = mod_index * torch.sin(2.0 * torch.pi * mod_freq * t)
-        carrier = torch.sin(2.0 * torch.pi * carrier_freq * t + modulator)
+        # FM synthesis - all scalar operations on vectorized time
+        two_pi = 2.0 * math.pi
+        mod_freq = cf * mr
+        modulator = mi * torch.sin(two_pi * mod_freq * t)
+        carrier = torch.sin(two_pi * cf * t + modulator)
 
         audio = env * carrier
+
+        # Apply filters - skip if frequencies are neutral (common case)
+        if highpass_freq > 1.0:  # Anything above 1 Hz is meaningful
+            audio = self._apply_highpass_filter(audio, highpass_freq)
+        if lowpass_freq < 20000.0:  # Anything below 20k is filtering
+            audio = self._apply_lowpass_filter(audio, lowpass_freq)
 
         # Soft peak normalization (avoid clicks from sudden changes)
         # Only normalize if gate is open; if closed, let it stay quiet
