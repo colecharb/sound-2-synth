@@ -8,6 +8,9 @@ output.wav
 data/
 checkpoints/
 
+# samples for testing purposes
+audio_samples/
+
 # Cached embeddings and large files
 *.pt
 *.pth
