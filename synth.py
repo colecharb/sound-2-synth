@@ -207,11 +207,30 @@ class FMSynth(nn.Module):
 
         # Sustain plateau
         sustain_level = sustain.expand_as(t)
-
-        # Release ramp: sustain → 0
+        
+        # Compute the envelope value at the moment of release
+        # This determines where the release ramp starts from
+        release_start_progress = (gate_release_time - t_attack_end).clamp(min=0.0)
+        if release_start_progress > decay:
+            release_start_progress = decay
+        
+        release_start_value = torch.where(
+            gate_release_time <= t_attack_end,
+            # Released during attack: interpolate attack ramp
+            gate_release_time / attack,
+            torch.where(
+                gate_release_time <= t_decay_end,
+                # Released during decay: interpolate decay ramp
+                1.0 - (1.0 - sustain) * (release_start_progress / decay),
+                # Released after decay: start from sustain level
+                sustain
+            )
+        )
+        
+        # Release ramp: release_start_value → 0
         release_progress = ((t - gate_release_time) / release).clamp(0.0, 1.0)
-        release_ramp = sustain * (1.0 - release_progress)
-
+        release_ramp = release_start_value * (1.0 - release_progress)
+        
         # Determine if gate was ever opened
         # If gate_release_time is very early (< 0), gate was never opened, so skip to release immediately
         gate_was_opened = (gate_release_time > -100).float()  # Threshold to detect "gate never opened"
@@ -229,7 +248,7 @@ class FMSynth(nn.Module):
         in_decay = in_decay / total
         in_sustain = in_sustain / total
         in_release = in_release / total
-
+        
         env = (
             in_attack * attack_ramp
             + in_decay * decay_ramp
