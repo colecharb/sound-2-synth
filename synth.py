@@ -268,15 +268,20 @@ class FMSynth(nn.Module):
 
     def _apply_lowpass_filter(self, audio: torch.Tensor, cutoff_freq: float) -> torch.Tensor:
         """
-        Apply a first-order low-pass filter with state continuity.
-        
+        Apply a first-order low-pass filter.
+
+        Differentiable: implements y[i] = alpha*x[i] + beta*y[i-1] by folding the
+        input with `torch.nn.functional.conv1d` using an FIR approximation of the
+        IIR response truncated to `ir_len` taps.  This keeps the full graph intact
+        without a Python-level sample loop.
+
         Parameters
         ----------
         audio : torch.Tensor
             Input audio samples.
         cutoff_freq : float
             Cutoff frequency in Hz.
-            
+
         Returns
         -------
         torch.Tensor
@@ -284,40 +289,48 @@ class FMSynth(nn.Module):
         """
         if cutoff_freq <= 0 or cutoff_freq >= self.sample_rate / 2:
             return audio
-        
+
+        n = audio.shape[0]
+        if n == 0:
+            return audio
+
         wc = 2.0 * math.pi * cutoff_freq / self.sample_rate
         alpha = wc / (wc + 1.0)
         beta = 1.0 - alpha
-        
-        n = audio.shape[0]
-        if n == 0:
-            return audio
-        
-        # Simple loop-based IIR filter with state continuity
-        # y[i] = alpha * x[i] + beta * y[i-1]
-        filtered = torch.zeros_like(audio)
-        state = self.lowpass_state
-        
-        for i in range(n):
-            state = alpha * float(audio[i]) + beta * state
-            filtered[i] = state
-        
-        # Save final state for next chunk
-        self.lowpass_state = state
-        
+
+        # Truncated IIR impulse response: h[k] = alpha * beta^k
+        # Truncate when beta^k < 1e-6  =>  k < log(1e-6)/log(beta)
+        if beta < 1.0 - 1e-9:
+            ir_len = min(int(math.log(1e-6) / math.log(beta)) + 1, n)
+        else:
+            ir_len = n
+
+        k = torch.arange(ir_len, dtype=audio.dtype, device=audio.device)
+        kernel = alpha * (beta ** k)  # shape (ir_len,)
+
+        # conv1d: input (1, 1, n), kernel (1, 1, ir_len) with causal padding
+        x = audio.unsqueeze(0).unsqueeze(0)          # (1, 1, n)
+        w = kernel.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, ir_len)
+        pad = ir_len - 1
+        filtered = torch.nn.functional.conv1d(x, w, padding=pad)
+        filtered = filtered[0, 0, :n]  # trim to original length
+
         return filtered
-    
+
     def _apply_highpass_filter(self, audio: torch.Tensor, cutoff_freq: float) -> torch.Tensor:
         """
-        Apply a first-order high-pass filter with state continuity.
-        
+        Apply a first-order high-pass filter.
+
+        Differentiable: high-pass = input - lowpass(input), which requires no
+        additional implementation beyond reusing the lowpass filter above.
+
         Parameters
         ----------
         audio : torch.Tensor
             Input audio samples.
         cutoff_freq : float
             Cutoff frequency in Hz.
-            
+
         Returns
         -------
         torch.Tensor
@@ -325,31 +338,8 @@ class FMSynth(nn.Module):
         """
         if cutoff_freq <= 0 or cutoff_freq >= self.sample_rate / 2:
             return audio
-        
-        # First-order high-pass: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
-        wc = 2.0 * math.pi * cutoff_freq / self.sample_rate
-        alpha = 1.0 / (wc + 1.0)
-        
-        n = audio.shape[0]
-        if n == 0:
-            return audio
-        
-        # Simple loop-based IIR filter with state continuity
-        filtered = torch.zeros_like(audio)
-        state = self.highpass_state
-        last_sample = self.highpass_prev_sample
-        
-        for i in range(n):
-            current_sample = float(audio[i])
-            state = alpha * (state + current_sample - last_sample)
-            filtered[i] = state
-            last_sample = current_sample
-        
-        # Save state for next chunk
-        self.highpass_state = state
-        self.highpass_prev_sample = last_sample
-        
-        return filtered
+
+        return audio - self._apply_lowpass_filter(audio, cutoff_freq)
 
     def generate_chunk(
         self,
