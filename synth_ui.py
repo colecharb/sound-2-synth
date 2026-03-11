@@ -565,7 +565,6 @@ class SynthUI(App):
         Binding("3", "load_preset('bass')", "Preset 3", show=False),
         Binding("4", "load_preset('brass')", "Preset 4", show=False),
         Binding("5", "load_preset('noise')", "Preset 5", show=False),
-        Binding("e", "export_note()", "Export", show=True),
     ]
 
     CSS = """
@@ -691,7 +690,7 @@ class SynthUI(App):
                 yield KeyboardWidget(self.audio_manager, id="keyboard")
 
         yield Static(
-            "[dim]SPACE[/dim] Gate  |  [dim]1-5[/dim] Presets  |  [dim]E[/dim] Export  |  [dim]↑/↓[/dim] Adjust  |  [dim]Q[/dim] Quit  |  [dim]S-L[/dim] Keys",
+            "[dim]SPACE[/dim] Gate  |  [dim]1-5[/dim] Presets  |  [dim]↑/↓[/dim] Adjust  |  [dim]Q[/dim] Quit  |  [dim]S-L[/dim] Keys",
             id="footer",
         )
 
