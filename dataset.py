@@ -90,36 +90,68 @@ def get_openl3_embedding(audio: torch.Tensor, sample_rate: int = 44100) -> torch
     Audio should be a 1D torch tensor on CPU. Returns a 512-dimensional embedding.
     """
     try:
+        # Workaround for pkg_resources import issue in resampy on Python 3.11+
+        import sys
+        if 'pkg_resources' not in sys.modules:
+            try:
+                import pkg_resources  # noqa: F401
+            except ImportError:
+                # Provide a minimal pkg_resources wrapper for resampy
+                import importlib.resources as resources
+                import importlib.util
+                
+                class PkgResources:
+                    """Minimal wrapper to provide resource_filename for resampy."""
+                    @staticmethod
+                    def resource_filename(package_name, fname):
+                        # For resampy, locate filter files in its data directory
+                        try:
+                            spec = importlib.util.find_spec(package_name)
+                            if spec and spec.origin:
+                                import os
+                                pkg_dir = os.path.dirname(spec.origin)
+                                return os.path.join(pkg_dir, fname)
+                        except (ImportError, ValueError):
+                            pass
+                        return None
+                
+                sys.modules['pkg_resources'] = PkgResources()
+        
         import openl3
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
             "openl3 is required. Install it with:\n"
             "  pip install openl3 librosa\n"
-            "  Note: openl3 may require additional system dependencies (libsndfile)"
+            "  Note: openl3 may require additional system dependencies (libsndfile)\n"
+            f"Import error: {e}"
         )
     
     # Convert tensor to numpy
     audio_np = audio.cpu().numpy().astype(np.float32)
     
-    # Load OpenL3 model in PyTorch mode (frozen, no grad)
+    # Load OpenL3 model (TensorFlow/Keras, used in inference-only mode)
+    # embedding_size: 512, input_repr: mel256, content_type: music
     model = openl3.models.load_audio_embedding_model(
         input_repr="mel256",
         content_type="music",
-        framework="pytorch"
+        embedding_size=512
     )
-    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
-    model.eval()
     
-    # Extract embedding
-    with torch.no_grad():
-        audio_tensor = torch.from_numpy(audio_np).float().to(model.device)
-        # OpenL3 expects (batch, samples) but we have (samples,), so unsqueeze
-        audio_tensor = audio_tensor.unsqueeze(0)
-        embedding = model(audio_tensor, sr=sample_rate)
+    # Extract embedding using OpenL3's embedding function
+    # This handles the audio preprocessing and model inference
+    # Returns tuple of (embeddings, timestamps)
+    embeddings_np, _ = openl3.get_audio_embedding(
+        audio_np,
+        sr=sample_rate,
+        input_repr="mel256",
+        content_type="music",
+        embedding_size=512,
+        center=True
+    )
     
-    # embedding shape: (1, 512, num_frames)
-    # Average across frames to get (1, 512) then squeeze to (512,)
-    embedding = embedding.mean(dim=2).squeeze(0)
+    # embeddings_np shape: (num_frames, 512)
+    # Average across frames to get single 512-D embedding, convert to torch
+    embedding = torch.from_numpy(embeddings_np.mean(axis=0)).float()  # (512,)
     
     return embedding
 
