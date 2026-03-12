@@ -1,8 +1,10 @@
 """
 model.py — MLP Parameter Predictor
 
-Maps OpenL3 embeddings (512-dim) to FM synth parameters (10-dim).
-Architecture: 512 → 256 → 128 → 10 with ReLU activations.
+Maps audio embeddings to FM synth parameters (10-dim).
+Architecture: embedding_dim → 256 → 128 → 10 with ReLU activations.
+
+Supports any embedding dimension (mel=256, openl3=512, panns=2048, etc.).
 """
 
 import torch
@@ -42,9 +44,9 @@ LOG_SCALE_PARAMS = {"lowpass_freq", "highpass_freq"}
 
 
 class ParameterPredictor(nn.Module):
-    """MLP that maps OpenL3 embeddings to FM synth parameters.
+    """MLP that maps audio embeddings to FM synth parameters.
     
-    Input: 512-dimensional OpenL3 embedding
+    Input: embedding_dim-dimensional audio embedding (mel=256, panns=2048, openl3=512)
     Output: 10-dimensional parameter vector (clamped to valid ranges)
     
     The output uses sigmoid activation and is scaled to each parameter's
@@ -162,18 +164,9 @@ class ParameterPredictor(nn.Module):
 
 
 if __name__ == "__main__":
-    # Quick test
-    model = ParameterPredictor()
-    print(f"ParameterPredictor architecture:")
-    print(model)
-    print(f"\nTotal parameters: {sum(p.numel() for p in model.parameters())}")
-    
-    # Test forward pass
-    dummy_embedding = torch.randn(1, 512)
-    output = model(dummy_embedding)
-    print(f"\nTest output shape: {output.shape}")
-    print(f"Test output (first 5 params): {output[0, :5]}")
-    print(f"Parameter ranges:")
-    for i, name in enumerate(PARAM_NAMES[:5]):
-        min_val, max_val = PARAM_RANGES[name]
-        print(f"  {name:20} : [{min_val:8.2f}, {max_val:8.2f}]")
+    for dim, label in [(256, "mel"), (512, "openl3"), (2048, "panns")]:
+        model = ParameterPredictor(embedding_dim=dim)
+        n_params = sum(p.numel() for p in model.parameters())
+        dummy = torch.randn(1, dim)
+        out = model(dummy)
+        print(f"  {label:8s}  embed={dim:5d}  model_params={n_params:,}  out={out.shape}")
