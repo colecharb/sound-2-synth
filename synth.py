@@ -52,6 +52,188 @@ class FMSynth(nn.Module):
         self.highpass_state = 0.0
         self.highpass_prev_sample = 0.0
 
+    def forward_batch(
+        self,
+        carrier_freq: torch.Tensor,
+        mod_ratio: torch.Tensor,
+        mod_index: torch.Tensor,
+        attack: torch.Tensor,
+        decay: torch.Tensor,
+        sustain: torch.Tensor,
+        release: torch.Tensor,
+        note_duration: torch.Tensor,
+        lowpass_freq: torch.Tensor,
+        highpass_freq: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Render a batch of notes in parallel.
+
+        Parameters
+        ----------
+        carrier_freq : Tensor
+            Shape (batch_size,), carrier frequencies in Hz
+        mod_ratio : Tensor
+            Shape (batch_size,), modulator ratios
+        mod_index : Tensor
+            Shape (batch_size,), modulation depths
+        attack : Tensor
+            Shape (batch_size,), attack times in seconds
+        decay : Tensor
+            Shape (batch_size,), decay times in seconds
+        sustain : Tensor
+            Shape (batch_size,), sustain levels (0-1)
+        release : Tensor
+            Shape (batch_size,), release times in seconds
+        note_duration : Tensor
+            Shape (batch_size,), note sustain durations in seconds
+        lowpass_freq : Tensor
+            Shape (batch_size,), lowpass cutoff frequencies in Hz
+        highpass_freq : Tensor
+            Shape (batch_size,), highpass cutoff frequencies in Hz
+
+        Returns
+        -------
+        Tensor
+            Shape (batch_size, max_samples), padded to max duration in batch
+            Samples past each note's true duration are zeros.
+        """
+        batch_size = carrier_freq.shape[0]
+        sr = self.sample_rate
+
+        # Clamp parameters
+        attack = attack.clamp(min=1e-4)
+        decay = decay.clamp(min=1e-4)
+        sustain = sustain.clamp(0.0, 1.0)
+        release = release.clamp(min=1e-4)
+        note_duration = note_duration.clamp(min=0.0)
+
+        # Compute total duration per sample and find max
+        total_duration = attack + decay + note_duration + release  # (B,)
+        max_duration = total_duration.max().item()
+        max_samples = int(max_duration * sr) + 1  # +1 for safety
+
+        # Create time vector: (1, max_samples)
+        t = torch.arange(max_samples, dtype=torch.float32, device=carrier_freq.device) / sr
+        t = t.unsqueeze(0)  # (1, max_samples)
+
+        # Reshape parameters for broadcasting: (B, 1)
+        carrier_freq_b = carrier_freq.unsqueeze(1)  # (B, 1)
+        mod_ratio_b = mod_ratio.unsqueeze(1)
+        mod_index_b = mod_index.unsqueeze(1)
+        attack_b = attack.unsqueeze(1)
+        decay_b = decay.unsqueeze(1)
+        sustain_b = sustain.unsqueeze(1)
+        release_b = release.unsqueeze(1)
+        note_duration_b = note_duration.unsqueeze(1)
+        lowpass_freq_b = lowpass_freq.unsqueeze(1)
+        highpass_freq_b = highpass_freq.unsqueeze(1)
+        total_duration_b = total_duration.unsqueeze(1)  # (B, 1)
+
+        # --- ADSR envelope (batched) ---
+        env = self._adsr_batch(
+            t, attack_b, decay_b, sustain_b, release_b, note_duration_b
+        )  # (B, max_samples)
+
+        # --- FM synthesis (batched) ---
+        mod_freq = carrier_freq_b * mod_ratio_b
+        modulator = mod_index_b * torch.sin(2.0 * torch.pi * mod_freq * t)
+        carrier = torch.sin(2.0 * torch.pi * carrier_freq_b * t + modulator)
+
+        audio = env * carrier  # (B, max_samples)
+
+        # --- Apply filters per sample (filters are cheap compared to synthesis) ---
+        # and peak normalize
+        audio_filtered_list = []
+        for i in range(batch_size):
+            sample_audio = audio[i]  # (max_samples,)
+            sample_highpass_freq = float(highpass_freq[i])
+            sample_lowpass_freq = float(lowpass_freq[i])
+
+            # Filters
+            self.reset_filter_state()
+            sample_audio = self._apply_highpass_filter(sample_audio, sample_highpass_freq)
+            sample_audio = self._apply_lowpass_filter(sample_audio, sample_lowpass_freq)
+
+            # Peak normalize
+            peak = sample_audio.abs().max()
+            if peak > 1e-8:
+                sample_audio = sample_audio / peak
+
+            audio_filtered_list.append(sample_audio)
+
+        audio_filtered = torch.stack(audio_filtered_list, dim=0)  # (B, max_samples)
+
+        # --- Mask out samples past each note's true duration ---
+        validity_mask = t < total_duration_b  # (B, max_samples)
+        audio_filtered = audio_filtered * validity_mask.float()
+
+        return audio_filtered
+
+    def _adsr_batch(
+        self,
+        t: torch.Tensor,
+        attack: torch.Tensor,
+        decay: torch.Tensor,
+        sustain: torch.Tensor,
+        release: torch.Tensor,
+        note_duration: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build ADSR envelopes for a batch of notes.
+
+        Parameters
+        ----------
+        t : Tensor
+            Time vector, shape (1, max_samples)
+        attack : Tensor
+            Shape (batch_size, 1)
+        decay : Tensor
+            Shape (batch_size, 1)
+        sustain : Tensor
+            Shape (batch_size, 1)
+        release : Tensor
+            Shape (batch_size, 1)
+        note_duration : Tensor
+            Shape (batch_size, 1)
+
+        Returns
+        -------
+        Tensor
+            Shape (batch_size, max_samples), ADSR envelope for each note
+        """
+        t_attack_end = attack  # (B, 1)
+        t_decay_end = attack + decay  # (B, 1)
+        t_sustain_end = attack + decay + note_duration  # (B, 1)
+
+        # Attack ramp: 0 → 1
+        attack_ramp = (t / attack).clamp(0.0, 1.0)  # broadcasts to (B, max_samples)
+
+        # Decay ramp: 1 → sustain
+        decay_progress = ((t - t_attack_end) / decay).clamp(0.0, 1.0)
+        decay_ramp = 1.0 - (1.0 - sustain) * decay_progress
+
+        # Sustain plateau — sustain is (B, 1), broadcasts to (B, max_samples)
+        sustain_level = sustain  # Broadcasting will happen in the expression
+
+        # Release ramp: sustain → 0
+        release_progress = ((t - t_sustain_end) / release).clamp(0.0, 1.0)
+        release_ramp = sustain * (1.0 - release_progress)
+
+        # Blend phases with masking
+        in_attack = (t <= t_attack_end).float()  # (B, max_samples)
+        in_decay = ((t > t_attack_end) & (t <= t_decay_end)).float()
+        in_sustain = ((t > t_decay_end) & (t <= t_sustain_end)).float()
+        in_release = (t > t_sustain_end).float()
+
+        env = (
+            in_attack * attack_ramp
+            + in_decay * decay_ramp
+            + in_sustain * sustain_level
+            + in_release * release_ramp
+        )
+
+        return env
+
     def forward(
         self,
         carrier_freq: float | torch.Tensor = 440.0,
