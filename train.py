@@ -62,6 +62,56 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+SAMPLE_RATE = 44100
+NUM_AUDIO_SAMPLES = 4
+
+
+@torch.no_grad()
+def log_audio_to_wandb(
+    model: nn.Module,
+    synth: FMSynth,
+    val_loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    num_samples: int = NUM_AUDIO_SAMPLES,
+):
+    """Render a few validation examples and log target vs predicted audio to W&B."""
+    model.eval()
+
+    # Grab the first batch from val
+    batch = next(iter(val_loader))
+    embeddings = batch[0][:num_samples].to(device)
+    target_params = batch[1][:num_samples].to(device)
+
+    pred_params = model(embeddings)
+
+    target_audio = synth.forward_batch(target_params).cpu()
+    pred_audio = synth.forward_batch(pred_params).cpu()
+
+    audio_logs = {}
+    for i in range(min(num_samples, embeddings.shape[0])):
+        tgt = target_audio[i].float().numpy()
+        pred = pred_audio[i].float().numpy()
+
+        # Build a caption showing key param diffs
+        tp = target_params[i].cpu()
+        pp = pred_params[i].cpu()
+        caption = (
+            f"carrier: {tp[0]:.0f}→{pp[0]:.0f}Hz  "
+            f"ratio: {tp[1]:.2f}→{pp[1]:.2f}  "
+            f"index: {tp[2]:.1f}→{pp[2]:.1f}"
+        )
+
+        audio_logs[f"audio/sample_{i}_target"] = wandb.Audio(
+            tgt, sample_rate=SAMPLE_RATE, caption=f"[target] {caption}",
+        )
+        audio_logs[f"audio/sample_{i}_predicted"] = wandb.Audio(
+            pred, sample_rate=SAMPLE_RATE, caption=f"[predicted] {caption}",
+        )
+
+    wandb.log(audio_logs, step=epoch + 1)
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -208,6 +258,7 @@ def run_stage_a(args):
     output = args.output or "checkpoints/stage_a.pt"
 
     run = init_wandb(args, stage="A")
+    synth_for_audio = FMSynth(sample_rate=SAMPLE_RATE).to(device)
 
     print(f"\n{'=' * 60}")
     print(f"Stage A — param-space regression for {args.epochs} epochs")
@@ -219,18 +270,18 @@ def run_stage_a(args):
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
-        marker = ""
+        is_best = False
         if v_loss < best_val:
             best_val = v_loss
             best_epoch = epoch
+            is_best = True
             Path(output).parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), output)
-            marker = " ✓"
 
         print(
             f"Epoch {epoch+1:3d}/{args.epochs}  |  "
             f"Train: {t_loss:.6f}  Val: {v_loss:.6f}  "
-            f"LR={lr:.2e}{marker}"
+            f"LR={lr:.2e}{' ✓' if is_best else ''}"
         )
 
         if run:
@@ -241,6 +292,11 @@ def run_stage_a(args):
                 "lr": lr,
                 "best_val_loss": best_val,
             })
+            # Log audio every 10 epochs or on new best
+            if is_best or (epoch + 1) % 10 == 0:
+                log_audio_to_wandb(
+                    model, synth_for_audio, val_loader, device, epoch,
+                )
 
     if run:
         wandb.summary["best_val_mse"] = best_val
@@ -423,19 +479,19 @@ def run_stage_b(args):
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
-        marker = ""
+        is_best = False
         if v_spec < best_val_spec:
             best_val_spec = v_spec
             best_epoch = epoch
+            is_best = True
             Path(output).parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), output)
-            marker = " ✓"
 
         print(
             f"Epoch {epoch+1:3d}/{args.epochs}  |  "
             f"Train: {t_loss:.4f} (spec={t_spec:.3f} param={t_param:.4f})  |  "
             f"Val: {v_loss:.4f} (spec={v_spec:.3f})  |  "
-            f"pw={pw:.1f}  LR={lr:.2e}{marker}"
+            f"pw={pw:.1f}  LR={lr:.2e}{' ✓' if is_best else ''}"
         )
 
         if run:
@@ -451,6 +507,10 @@ def run_stage_b(args):
                 "lr": lr,
                 "best_val_spectral": best_val_spec,
             })
+            if is_best or (epoch + 1) % 5 == 0:
+                log_audio_to_wandb(
+                    model, synth, val_loader, device, epoch,
+                )
 
     if run:
         wandb.summary["best_val_spectral"] = best_val_spec
