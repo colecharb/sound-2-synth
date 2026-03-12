@@ -81,14 +81,14 @@ class MultiScaleSpectralLoss(nn.Module):
                 window=torch.hann_window(fft_size, device=predicted.device),
             )
             
-            # Magnitude
-            target_mag = torch.abs(target_spec)
-            predicted_mag = torch.abs(predicted_spec)
+            # Safe magnitude: sqrt(re² + im² + ε²) avoids the NaN gradient
+            # that torch.abs produces when a complex bin is exactly zero.
+            eps_sq = 1e-14
+            target_mag = (target_spec.real ** 2 + target_spec.imag ** 2 + eps_sq).sqrt()
+            predicted_mag = (predicted_spec.real ** 2 + predicted_spec.imag ** 2 + eps_sq).sqrt()
             
-            # Log magnitude (with small epsilon to avoid log(0))
-            epsilon = 1e-7
-            target_log_mag = torch.log(target_mag + epsilon)
-            predicted_log_mag = torch.log(predicted_mag + epsilon)
+            target_log_mag = torch.log(target_mag)
+            predicted_log_mag = torch.log(predicted_mag)
             
             # L1 loss
             scale_loss = torch.mean(torch.abs(target_log_mag - predicted_log_mag))

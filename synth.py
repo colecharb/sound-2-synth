@@ -131,6 +131,101 @@ class FMSynth(nn.Module):
 
         return audio
 
+    def forward_batch(self, params: torch.Tensor) -> torch.Tensor:
+        """
+        Render a batch of notes with vectorised ADSR + FM synthesis.
+
+        Parameters
+        ----------
+        params : torch.Tensor
+            Shape (batch, 10) with columns:
+            [carrier_freq, mod_ratio, mod_index, attack, decay,
+             sustain, release, note_duration, lowpass_freq, highpass_freq]
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (batch, max_samples) zero-padded, peak-normalised audio.
+        """
+        device = params.device
+        batch_size = params.shape[0]
+        sr = self.sample_rate
+
+        carrier_freq  = params[:, 0]
+        mod_ratio     = params[:, 1]
+        mod_index     = params[:, 2]
+        attack        = params[:, 3].clamp(min=1e-4)
+        decay         = params[:, 4].clamp(min=1e-4)
+        sustain       = params[:, 5].clamp(0.0, 1.0)
+        release       = params[:, 6].clamp(min=1e-4)
+        note_duration = params[:, 7].clamp(min=0.0)
+        lowpass_freq  = params[:, 8]
+        highpass_freq = params[:, 9]
+
+        total_duration = attack + decay + note_duration + release
+        max_dur = total_duration.max()
+        n_samples = int((max_dur * sr).item())
+        if n_samples == 0:
+            return torch.zeros(batch_size, 1, device=device)
+
+        # Shared time axis (1, n_samples), broadcasts with (batch, 1) params
+        t = torch.linspace(0.0, max_dur.item(), n_samples, device=device).unsqueeze(0)
+
+        att = attack.unsqueeze(1)
+        dec = decay.unsqueeze(1)
+        sus = sustain.unsqueeze(1)
+        rel = release.unsqueeze(1)
+        nd  = note_duration.unsqueeze(1)
+
+        # ---- vectorised ADSR ----
+        t_attack_end  = att
+        t_decay_end   = att + dec
+        t_sustain_end = att + dec + nd
+
+        attack_ramp      = (t / att).clamp(0.0, 1.0)
+        decay_progress   = ((t - t_attack_end) / dec).clamp(0.0, 1.0)
+        decay_ramp       = 1.0 - (1.0 - sus) * decay_progress
+        release_progress = ((t - t_sustain_end) / rel).clamp(0.0, 1.0)
+        release_ramp     = sus * (1.0 - release_progress)
+
+        in_attack  = (t <= t_attack_end).float()
+        in_decay   = ((t > t_attack_end) & (t <= t_decay_end)).float()
+        in_sustain = ((t > t_decay_end) & (t <= t_sustain_end)).float()
+        in_release = (t > t_sustain_end).float()
+
+        env = (in_attack * attack_ramp
+               + in_decay * decay_ramp
+               + in_sustain * sus
+               + in_release * release_ramp)
+
+        # ---- vectorised FM synthesis ----
+        cf = carrier_freq.unsqueeze(1)
+        mr = mod_ratio.unsqueeze(1)
+        mi = mod_index.unsqueeze(1)
+
+        mod_freq  = cf * mr
+        modulator = mi * torch.sin(2.0 * torch.pi * mod_freq * t)
+        carrier   = torch.sin(2.0 * torch.pi * cf * t + modulator)
+
+        audio = env * carrier  # (batch, n_samples)
+
+        # Batched filtering via FFT (replaces the per-sample conv1d loop)
+        audio = self._apply_filters_batch_fft(
+            audio, lowpass_freq.detach(), highpass_freq.detach(),
+        )
+
+        # Peak-normalise per sample
+        peak = audio.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+        audio = audio / peak
+
+        # Zero out samples beyond each note's actual duration
+        actual_n = (total_duration * sr).long()
+        idx = torch.arange(n_samples, device=device).unsqueeze(0)
+        mask = (idx < actual_n.unsqueeze(1)).float()
+        audio = audio * mask
+
+        return audio
+
     # ------------------------------------------------------------------
     def _adsr(
         self,
@@ -265,6 +360,45 @@ class FMSynth(nn.Module):
             + in_release * release_ramp
         )
         return env
+
+    def _apply_filters_batch_fft(
+        self,
+        audio: torch.Tensor,
+        lowpass_freqs: torch.Tensor,
+        highpass_freqs: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Batched filtering via FFT — single rfft → multiply → irfft pass.
+
+        Computes the exact first-order IIR frequency response per sample
+        and applies lowpass + highpass together. Replaces the O(batch)
+        conv1d loop with O(1) batched FFT operations.
+        """
+        batch_size, n_samples = audio.shape
+        device = audio.device
+        sr = self.sample_rate
+
+        X = torch.fft.rfft(audio)                            # (batch, n_freq)
+        n_freq = X.shape[1]
+
+        # Digital frequency per FFT bin: ω_k = 2πk / N
+        w = torch.arange(n_freq, device=device, dtype=audio.dtype) * (
+            2.0 * math.pi / n_samples
+        )
+        # z⁻¹ = exp(-jω)
+        exp_neg_jw = torch.complex(torch.cos(w), -torch.sin(w)).unsqueeze(0)
+
+        def _lp_response(cutoffs: torch.Tensor) -> torch.Tensor:
+            """First-order IIR lowpass: H(z) = α / (1 − β·z⁻¹)."""
+            wc = (2.0 * math.pi * cutoffs / sr).unsqueeze(1)    # (batch, 1)
+            alpha = wc / (wc + 1.0)
+            beta = 1.0 - alpha
+            return alpha / (1.0 - beta * exp_neg_jw)            # (batch, n_freq)
+
+        H_lp = _lp_response(lowpass_freqs)
+        H_hp = 1.0 - _lp_response(highpass_freqs)
+
+        return torch.fft.irfft(X * H_lp * H_hp, n=n_samples)
 
     def _apply_lowpass_filter(self, audio: torch.Tensor, cutoff_freq: float) -> torch.Tensor:
         """
