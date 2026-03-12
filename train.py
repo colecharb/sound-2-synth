@@ -163,19 +163,22 @@ def load_dataset(
     dataset_path: str,
     train_split: float = 0.8,
     batch_size: int = 128,
-    stage: str = "A",
 ):
     """Load dataset and build dataloaders.
 
-    For Stage A only embeddings + params are needed.
-    For Stage B the precomputed target specs are also loaded.
+    Both Stage A and Stage B use the same lightweight dataset
+    (embeddings + params).  Stage B computes spectral loss on-the-fly.
+
+    Returns (train_loader, val_loader, embedding_dim).
     """
     print(f"\nLoading dataset from {dataset_path}...")
     data = torch.load(dataset_path, map_location="cpu")
     embeddings = data["embeddings"]
     params = data["params"]
+    embedding_type = data.get("embedding_type", "openl3")
+    embedding_dim = data.get("embedding_dim", embeddings.shape[1])
 
-    print(f"  Embeddings: {embeddings.shape}")
+    print(f"  Embeddings: {embeddings.shape} ({embedding_type})")
     print(f"  Params:     {params.shape}")
 
     n = embeddings.shape[0]
@@ -183,45 +186,14 @@ def load_dataset(
     idx = torch.randperm(n)
     train_idx, val_idx = idx[:n_train], idx[n_train:]
 
-    if stage == "A":
-        train_ds = TensorDataset(embeddings[train_idx], params[train_idx])
-        val_ds = TensorDataset(embeddings[val_idx], params[val_idx])
-        print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}")
-        return (
-            DataLoader(train_ds, batch_size=batch_size, shuffle=True),
-            DataLoader(val_ds, batch_size=batch_size),
-            None,  # no target specs for stage A
-        )
-
-    # Stage B — also load precomputed target specs
-    target_specs = data.get("target_specs", None)
-    if target_specs is None:
-        raise ValueError(
-            "Dataset has no precomputed target_specs.  "
-            "Regenerate with the updated dataset.py."
-        )
-
-    # Build tensors: (embeddings, params, spec_512, spec_1024, spec_2048)
-    spec_tensors_train = [target_specs[s][train_idx] for s in sorted(target_specs)]
-    spec_tensors_val = [target_specs[s][val_idx] for s in sorted(target_specs)]
-
-    train_ds = TensorDataset(
-        embeddings[train_idx], params[train_idx], *spec_tensors_train,
-    )
-    val_ds = TensorDataset(
-        embeddings[val_idx], params[val_idx], *spec_tensors_val,
-    )
-
-    fft_sizes = sorted(target_specs.keys())
-    hop_ratio = data.get("spec_hop_ratio", 0.25)
-
+    train_ds = TensorDataset(embeddings[train_idx], params[train_idx])
+    val_ds = TensorDataset(embeddings[val_idx], params[val_idx])
     print(f"  Train: {len(train_ds)}  Val: {len(val_ds)}")
-    print(f"  Cached target specs: FFT sizes {fft_sizes}")
 
     return (
         DataLoader(train_ds, batch_size=batch_size, shuffle=True),
         DataLoader(val_ds, batch_size=batch_size),
-        {"fft_sizes": fft_sizes, "hop_ratio": hop_ratio},
+        embedding_dim,
     )
 
 
@@ -279,10 +251,15 @@ def init_wandb(args, stage: str):
     """Initialise a W&B run if --wandb is set, otherwise return None."""
     if not args.wandb:
         return None
+    if args.wandb_name:
+        run_id = wandb.util.generate_id()
+        run_name = f"{args.wandb_name}-{run_id}"
+    else:
+        run_name = None
     return wandb.init(
         entity=args.wandb_entity,
         project=args.wandb_project,
-        name=args.wandb_name,
+        name=run_name,
         config={
             "stage": stage,
             "dataset": args.dataset,
@@ -299,11 +276,11 @@ def run_stage_a(args):
     device = get_device()
     print(f"Using device: {device}")
 
-    train_loader, val_loader, _ = load_dataset(
-        args.dataset, batch_size=args.batch_size, stage="A",
+    train_loader, val_loader, embedding_dim = load_dataset(
+        args.dataset, batch_size=args.batch_size,
     )
 
-    model = ParameterPredictor(embedding_dim=512, dropout=0.1).to(device)
+    model = ParameterPredictor(embedding_dim=embedding_dim, dropout=0.1).to(device)
     print(f"\nModel: {sum(p.numel() for p in model.parameters())} params")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -382,39 +359,8 @@ def run_stage_a(args):
 # Stage B — spectral fine-tuning
 # ---------------------------------------------------------------------------
 
-def spectral_loss_with_cached_targets(
-    predicted_audio: torch.Tensor,
-    target_log_mags: list[torch.Tensor],
-    fft_sizes: list[int],
-    hop_ratio: float,
-) -> torch.Tensor:
-    """Compute multi-scale spectral loss using precomputed target log-mags.
-
-    Only the predicted audio needs an STFT — the target side is free.
-    """
-    total = 0.0
-    for target_lm, fft_size in zip(target_log_mags, fft_sizes):
-        hop = int(fft_size * hop_ratio)
-        window = torch.hann_window(fft_size, device=predicted_audio.device)
-        pred_stft = torch.stft(
-            predicted_audio, n_fft=fft_size, hop_length=hop,
-            window=window, return_complex=True,
-        )
-        eps_sq = 1e-14
-        pred_mag = (pred_stft.real ** 2 + pred_stft.imag ** 2 + eps_sq).sqrt()
-        pred_lm = torch.log(pred_mag)
-
-        # Trim to shorter time axis (predicted duration may differ)
-        t_min = min(pred_lm.shape[-1], target_lm.shape[-1])
-        total = total + torch.mean(
-            torch.abs(pred_lm[:, :, :t_min] - target_lm[:, :, :t_min])
-        )
-    return total / len(fft_sizes)
-
-
 def train_epoch_B(
-    model, synth, loader, optimizer, device,
-    fft_sizes, hop_ratio, param_weight,
+    model, synth, loader, optimizer, device, param_weight,
 ):
     model.train()
     total_loss = 0.0
@@ -425,24 +371,19 @@ def train_epoch_B(
     for batch in pbar:
         embeddings = batch[0].to(device)
         target_params = batch[1].to(device)
-        target_lms = [batch[2 + i].to("cpu") for i in range(len(fft_sizes))]
 
         pred_params = model(embeddings)
 
-        # Param MSE (cheap)
         p_loss = torch.tensor(0.0, device=device)
         if param_weight > 0:
             p_loss = nn.functional.mse_loss(
                 normalize_params(pred_params), normalize_params(target_params),
             )
 
-        # Render predicted audio through synth
+        target_audio = synth.forward_batch(target_params)
         pred_audio = synth.forward_batch(pred_params)
 
-        # STFT on CPU (MPS doesn't support it; unified memory = free copy)
-        s_loss = spectral_loss_with_cached_targets(
-            pred_audio.cpu(), target_lms, fft_sizes, hop_ratio,
-        )
+        s_loss = compute_spectral_loss(target_audio.cpu(), pred_audio.cpu())
 
         loss = s_loss + param_weight * p_loss
         optimizer.zero_grad()
@@ -460,7 +401,7 @@ def train_epoch_B(
 
 
 @torch.no_grad()
-def validate_B(model, synth, loader, device, fft_sizes, hop_ratio, param_weight):
+def validate_B(model, synth, loader, device, param_weight):
     model.eval()
     total_loss = 0.0
     total_spec = 0.0
@@ -469,7 +410,6 @@ def validate_B(model, synth, loader, device, fft_sizes, hop_ratio, param_weight)
     for batch in loader:
         embeddings = batch[0].to(device)
         target_params = batch[1].to(device)
-        target_lms = [batch[2 + i].to("cpu") for i in range(len(fft_sizes))]
 
         pred_params = model(embeddings)
 
@@ -479,10 +419,9 @@ def validate_B(model, synth, loader, device, fft_sizes, hop_ratio, param_weight)
                 normalize_params(pred_params), normalize_params(target_params),
             )
 
+        target_audio = synth.forward_batch(target_params)
         pred_audio = synth.forward_batch(pred_params)
-        s_loss = spectral_loss_with_cached_targets(
-            pred_audio.cpu(), target_lms, fft_sizes, hop_ratio,
-        )
+        s_loss = compute_spectral_loss(target_audio.cpu(), pred_audio.cpu())
 
         loss = s_loss + param_weight * p_loss
         total_loss += loss.item()
@@ -497,13 +436,11 @@ def run_stage_b(args):
     device = get_device()
     print(f"Using device: {device}")
 
-    train_loader, val_loader, spec_info = load_dataset(
-        args.dataset, batch_size=args.batch_size, stage="B",
+    train_loader, val_loader, embedding_dim = load_dataset(
+        args.dataset, batch_size=args.batch_size,
     )
-    fft_sizes = spec_info["fft_sizes"]
-    hop_ratio = spec_info["hop_ratio"]
 
-    model = ParameterPredictor(embedding_dim=512, dropout=0.1).to(device)
+    model = ParameterPredictor(embedding_dim=embedding_dim, dropout=0.1).to(device)
 
     # Load Stage A checkpoint
     ckpt = args.checkpoint or "checkpoints/stage_a.pt"
@@ -537,12 +474,10 @@ def run_stage_b(args):
         pw = pw_start * max(0.0, 1.0 - epoch / pw_anneal) if pw_anneal > 0 else 0.0
 
         t_loss, t_spec, t_param = train_epoch_B(
-            model, synth, train_loader, optimizer, device,
-            fft_sizes, hop_ratio, pw,
+            model, synth, train_loader, optimizer, device, pw,
         )
         v_loss, v_spec, v_param = validate_B(
-            model, synth, val_loader, device,
-            fft_sizes, hop_ratio, pw,
+            model, synth, val_loader, device, pw,
         )
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
@@ -625,7 +560,7 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="sound-2-synth",
                         help="W&B project name")
     parser.add_argument("--wandb_name", type=str, default=None,
-                        help="W&B run name (auto-generated if omitted)")
+                        help="W&B run name prefix (appended with a random ID; auto-generated if omitted)")
 
     args = parser.parse_args()
 
