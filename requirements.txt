@@ -1,11 +1,19 @@
 torch
+torchaudio
 soundfile
 sounddevice
 numpy<2
 scipy==1.11.0
 textual
 pynput
+tqdm
 
-# Training pipeline dependencies (heavy: openl3 pulls in TensorFlow)
-openl3
-librosa==0.10.0
+# Embedding: panns (optional — only needed for --embedding panns)
+# panns_inference
+
+# Embedding: openl3 (optional — only needed for --embedding openl3, pulls TensorFlow)
+# openl3
+# librosa==0.10.0
+
+# Experiment tracking
+wandb
