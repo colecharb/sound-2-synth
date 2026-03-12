@@ -99,55 +99,41 @@ def train_epoch(
         # Predict parameters
         predicted_params = model(embeddings)
         
-        # Render audio from both target and predicted parameters
-        target_audio_list = []
-        predicted_audio_list = []
-        
-        for i in range(target_params.shape[0]):
-            # Target audio — no grad needed, targets are fixed
-            with torch.no_grad():
-                target_audio = synth.forward(
-                    carrier_freq=target_params[i, 0],
-                    mod_ratio=target_params[i, 1],
-                    mod_index=target_params[i, 2],
-                    attack=target_params[i, 3],
-                    decay=target_params[i, 4],
-                    sustain=target_params[i, 5],
-                    release=target_params[i, 6],
-                    note_duration=target_params[i, 7],
-                    lowpass_freq=target_params[i, 8],
-                    highpass_freq=target_params[i, 9],
-                )
-            target_audio_list.append(target_audio)
-
-            # Predicted audio — pass tensors directly to keep the grad graph intact
-            predicted_audio = synth.forward(
-                carrier_freq=predicted_params[i, 0],
-                mod_ratio=predicted_params[i, 1],
-                mod_index=predicted_params[i, 2],
-                attack=predicted_params[i, 3],
-                decay=predicted_params[i, 4],
-                sustain=predicted_params[i, 5],
-                release=predicted_params[i, 6],
-                note_duration=predicted_params[i, 7],
-                lowpass_freq=predicted_params[i, 8],
-                highpass_freq=predicted_params[i, 9],
+        # Render audio batches using vectorized forward_batch
+        with torch.no_grad():
+            target_audio_batch = synth.forward_batch(
+                carrier_freq=target_params[:, 0],
+                mod_ratio=target_params[:, 1],
+                mod_index=target_params[:, 2],
+                attack=target_params[:, 3],
+                decay=target_params[:, 4],
+                sustain=target_params[:, 5],
+                release=target_params[:, 6],
+                note_duration=target_params[:, 7],
+                lowpass_freq=target_params[:, 8],
+                highpass_freq=target_params[:, 9],
             )
-            predicted_audio_list.append(predicted_audio)
         
-        # Pad to same length (use max length)
-        max_len = max(a.shape[0] for a in target_audio_list + predicted_audio_list)
-        target_audio_padded = []
-        predicted_audio_padded = []
+        predicted_audio_batch = synth.forward_batch(
+            carrier_freq=predicted_params[:, 0],
+            mod_ratio=predicted_params[:, 1],
+            mod_index=predicted_params[:, 2],
+            attack=predicted_params[:, 3],
+            decay=predicted_params[:, 4],
+            sustain=predicted_params[:, 5],
+            release=predicted_params[:, 6],
+            note_duration=predicted_params[:, 7],
+            lowpass_freq=predicted_params[:, 8],
+            highpass_freq=predicted_params[:, 9],
+        )
         
-        for target_a, pred_a in zip(target_audio_list, predicted_audio_list):
-            pad_target = torch.nn.functional.pad(target_a, (0, max_len - target_a.shape[0]))
-            pad_pred = torch.nn.functional.pad(pred_a, (0, max_len - pred_a.shape[0]))
-            target_audio_padded.append(pad_target)
-            predicted_audio_padded.append(pad_pred)
-        
-        target_audio_batch = torch.stack(target_audio_padded).to(device)
-        predicted_audio_batch = torch.stack(predicted_audio_padded).to(device)
+        # Ensure both audio tensors are the same length for loss computation
+        # (important for STFT when samples have different lengths in the batch)
+        max_len = max(target_audio_batch.shape[1], predicted_audio_batch.shape[1])
+        if target_audio_batch.shape[1] < max_len:
+            target_audio_batch = torch.nn.functional.pad(target_audio_batch, (0, max_len - target_audio_batch.shape[1]))
+        if predicted_audio_batch.shape[1] < max_len:
+            predicted_audio_batch = torch.nn.functional.pad(predicted_audio_batch, (0, max_len - predicted_audio_batch.shape[1]))
         
         # Compute loss
         loss = spectral_loss_fn(target_audio_batch, predicted_audio_batch)
@@ -190,52 +176,39 @@ def validate(
             # Predict parameters
             predicted_params = model(embeddings)
             
-            # Render audio (same as in training)
-            target_audio_list = []
-            predicted_audio_list = []
+            # Render audio batches using vectorized forward_batch
+            target_audio_batch = synth.forward_batch(
+                carrier_freq=target_params[:, 0],
+                mod_ratio=target_params[:, 1],
+                mod_index=target_params[:, 2],
+                attack=target_params[:, 3],
+                decay=target_params[:, 4],
+                sustain=target_params[:, 5],
+                release=target_params[:, 6],
+                note_duration=target_params[:, 7],
+                lowpass_freq=target_params[:, 8],
+                highpass_freq=target_params[:, 9],
+            )
             
-            for i in range(target_params.shape[0]):
-                target_audio = synth.forward(
-                    carrier_freq=target_params[i, 0],
-                    mod_ratio=target_params[i, 1],
-                    mod_index=target_params[i, 2],
-                    attack=target_params[i, 3],
-                    decay=target_params[i, 4],
-                    sustain=target_params[i, 5],
-                    release=target_params[i, 6],
-                    note_duration=target_params[i, 7],
-                    lowpass_freq=target_params[i, 8],
-                    highpass_freq=target_params[i, 9],
-                )
-                target_audio_list.append(target_audio)
-
-                predicted_audio = synth.forward(
-                    carrier_freq=predicted_params[i, 0],
-                    mod_ratio=predicted_params[i, 1],
-                    mod_index=predicted_params[i, 2],
-                    attack=predicted_params[i, 3],
-                    decay=predicted_params[i, 4],
-                    sustain=predicted_params[i, 5],
-                    release=predicted_params[i, 6],
-                    note_duration=predicted_params[i, 7],
-                    lowpass_freq=predicted_params[i, 8],
-                    highpass_freq=predicted_params[i, 9],
-                )
-                predicted_audio_list.append(predicted_audio)
+            predicted_audio_batch = synth.forward_batch(
+                carrier_freq=predicted_params[:, 0],
+                mod_ratio=predicted_params[:, 1],
+                mod_index=predicted_params[:, 2],
+                attack=predicted_params[:, 3],
+                decay=predicted_params[:, 4],
+                sustain=predicted_params[:, 5],
+                release=predicted_params[:, 6],
+                note_duration=predicted_params[:, 7],
+                lowpass_freq=predicted_params[:, 8],
+                highpass_freq=predicted_params[:, 9],
+            )
             
-            # Pad
-            max_len = max(a.shape[0] for a in target_audio_list + predicted_audio_list)
-            target_audio_padded = []
-            predicted_audio_padded = []
-            
-            for target_a, pred_a in zip(target_audio_list, predicted_audio_list):
-                pad_target = torch.nn.functional.pad(target_a, (0, max_len - target_a.shape[0]))
-                pad_pred = torch.nn.functional.pad(pred_a, (0, max_len - pred_a.shape[0]))
-                target_audio_padded.append(pad_target)
-                predicted_audio_padded.append(pad_pred)
-            
-            target_audio_batch = torch.stack(target_audio_padded).to(device)
-            predicted_audio_batch = torch.stack(predicted_audio_padded).to(device)
+            # Ensure both audio tensors are the same length for loss computation
+            max_len = max(target_audio_batch.shape[1], predicted_audio_batch.shape[1])
+            if target_audio_batch.shape[1] < max_len:
+                target_audio_batch = torch.nn.functional.pad(target_audio_batch, (0, max_len - target_audio_batch.shape[1]))
+            if predicted_audio_batch.shape[1] < max_len:
+                predicted_audio_batch = torch.nn.functional.pad(predicted_audio_batch, (0, max_len - predicted_audio_batch.shape[1]))
             
             loss = spectral_loss_fn(target_audio_batch, predicted_audio_batch)
             total_loss += loss.item()
