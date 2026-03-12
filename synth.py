@@ -373,16 +373,40 @@ class FMSynth(nn.Module):
         Computes the exact first-order IIR frequency response per sample
         and applies lowpass + highpass together. Replaces the O(batch)
         conv1d loop with O(1) batched FFT operations.
+        
+        Note: On devices where torch.fft is not implemented (e.g., Intel Mac MPS),
+        FFT computation is automatically moved to CPU while audio stays on original device.
         """
         batch_size, n_samples = audio.shape
         device = audio.device
         sr = self.sample_rate
 
-        X = torch.fft.rfft(audio)                            # (batch, n_freq)
+        # Check if FFT works on the current device
+        # If not, move to CPU for FFT only
+        fft_device = device
+        try:
+            # Quick test: try FFT on the target device
+            test = torch.randn(1, 10, device=device)
+            torch.fft.rfft(test)
+        except (RuntimeError, NotImplementedError):
+            # FFT not supported on this device, use CPU
+            fft_device = torch.device("cpu")
+
+        # Move to FFT device if needed
+        if fft_device != device:
+            audio_fft = audio.to(fft_device)
+            lowpass_freqs_fft = lowpass_freqs.to(fft_device)
+            highpass_freqs_fft = highpass_freqs.to(fft_device)
+        else:
+            audio_fft = audio
+            lowpass_freqs_fft = lowpass_freqs
+            highpass_freqs_fft = highpass_freqs
+
+        X = torch.fft.rfft(audio_fft)                       # (batch, n_freq)
         n_freq = X.shape[1]
 
         # Digital frequency per FFT bin: ω_k = 2πk / N
-        w = torch.arange(n_freq, device=device, dtype=audio.dtype) * (
+        w = torch.arange(n_freq, dtype=audio_fft.dtype, device=fft_device) * (
             2.0 * math.pi / n_samples
         )
         # z⁻¹ = exp(-jω)
@@ -395,10 +419,15 @@ class FMSynth(nn.Module):
             beta = 1.0 - alpha
             return alpha / (1.0 - beta * exp_neg_jw)            # (batch, n_freq)
 
-        H_lp = _lp_response(lowpass_freqs)
-        H_hp = 1.0 - _lp_response(highpass_freqs)
+        H_lp = _lp_response(lowpass_freqs_fft)
+        H_hp = 1.0 - _lp_response(highpass_freqs_fft)
 
-        return torch.fft.irfft(X * H_lp * H_hp, n=n_samples)
+        filtered = torch.fft.irfft(X * H_lp * H_hp, n=n_samples)
+        
+        # Move back to original device if needed
+        if fft_device != device:
+            return filtered.to(device)
+        return filtered
 
     def _apply_lowpass_filter(self, audio: torch.Tensor, cutoff_freq: float) -> torch.Tensor:
         """

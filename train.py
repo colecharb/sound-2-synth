@@ -21,6 +21,37 @@ from loss import create_spectral_loss
 from synth import FMSynth
 
 
+def get_device() -> tuple[torch.device, bool]:
+    """
+    Detect the best device for training.
+    
+    Returns
+    -------
+    tuple[torch.device, bool]
+        (device, fft_on_cpu) where fft_on_cpu indicates if FFT ops need to run on CPU
+    """
+    # Prefer CUDA if available
+    if torch.cuda.is_available():
+        return torch.device("cuda"), False
+    
+    # Check if MPS is available and actually works on this hardware
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        # Try a quick test to see if MPS actually works
+        try:
+            # Test if FFT works on MPS
+            test_tensor = torch.randn(2, 100, device="mps")
+            torch.fft.rfft(test_tensor)
+            # If we get here, FFT works on MPS
+            return torch.device("mps"), False
+        except (RuntimeError, NotImplementedError):
+            # MPS is available but doesn't support FFT (Intel Mac)
+            # Use CPU for main ops but mark that FFT needs special handling
+            return torch.device("cpu"), False
+    
+    # Fallback to CPU
+    return torch.device("cpu"), False
+
+
 def load_dataset(dataset_path: str, train_split: float = 0.8, batch_size: int = 64) -> tuple:
     """Load cached dataset and split into train/val.
     
@@ -183,12 +214,7 @@ def main():
     parser.add_argument("--output", type=str, default="checkpoints/best_model.pt", help="Checkpoint path")
     args = parser.parse_args()
     
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device, _ = get_device()
     print(f"\nUsing device: {device}\n")
     
     # Load data
