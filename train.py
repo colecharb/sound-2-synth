@@ -57,8 +57,13 @@ def normalize_params(params: torch.Tensor) -> torch.Tensor:
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        # Verify MPS actually supports FFT before committing to it
+        try:
+            torch.fft.rfft(torch.randn(2, 100, device="mps"))
+            return torch.device("mps")
+        except (RuntimeError, NotImplementedError):
+            pass
     return torch.device("cpu")
 
 
