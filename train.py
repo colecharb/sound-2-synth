@@ -64,6 +64,40 @@ def get_device() -> torch.device:
 
 SAMPLE_RATE = 44100
 NUM_AUDIO_SAMPLES = 4
+SPEC_FFT_SIZES = [512, 1024, 2048]
+SPEC_HOP_RATIO = 0.25
+
+
+def compute_spectral_loss(
+    target_audio: torch.Tensor,
+    predicted_audio: torch.Tensor,
+    fft_sizes: list[int] = None,
+    hop_ratio: float = SPEC_HOP_RATIO,
+) -> torch.Tensor:
+    """Multi-scale spectral loss on raw audio pairs (no precomputed specs)."""
+    if fft_sizes is None:
+        fft_sizes = SPEC_FFT_SIZES
+
+    min_len = min(target_audio.shape[-1], predicted_audio.shape[-1])
+    target_audio = target_audio[..., :min_len]
+    predicted_audio = predicted_audio[..., :min_len]
+
+    total = 0.0
+    for fft_size in fft_sizes:
+        hop = int(fft_size * hop_ratio)
+        window = torch.hann_window(fft_size, device=target_audio.device)
+        eps_sq = 1e-14
+
+        t_stft = torch.stft(target_audio, n_fft=fft_size, hop_length=hop,
+                            window=window, return_complex=True)
+        p_stft = torch.stft(predicted_audio, n_fft=fft_size, hop_length=hop,
+                            window=window, return_complex=True)
+
+        t_lm = torch.log((t_stft.real ** 2 + t_stft.imag ** 2 + eps_sq).sqrt())
+        p_lm = torch.log((p_stft.real ** 2 + p_stft.imag ** 2 + eps_sq).sqrt())
+        total = total + torch.mean(torch.abs(t_lm - p_lm))
+
+    return total / len(fft_sizes)
 
 
 @torch.no_grad()
@@ -74,11 +108,10 @@ def log_audio_to_wandb(
     device: torch.device,
     epoch: int,
     num_samples: int = NUM_AUDIO_SAMPLES,
-):
-    """Render a few validation examples and log target vs predicted audio to W&B."""
+) -> float:
+    """Render val examples, log audio to W&B, return spectral loss on those samples."""
     model.eval()
 
-    # Grab the first batch from val
     batch = next(iter(val_loader))
     embeddings = batch[0][:num_samples].to(device)
     target_params = batch[1][:num_samples].to(device)
@@ -88,12 +121,14 @@ def log_audio_to_wandb(
     target_audio = synth.forward_batch(target_params).cpu()
     pred_audio = synth.forward_batch(pred_params).cpu()
 
+    # Spectral loss on the rendered samples
+    spec_loss = compute_spectral_loss(target_audio, pred_audio).item()
+
     audio_logs = {}
     for i in range(min(num_samples, embeddings.shape[0])):
         tgt = target_audio[i].float().numpy()
         pred = pred_audio[i].float().numpy()
 
-        # Build a caption showing key param diffs
         tp = target_params[i].cpu()
         pp = pred_params[i].cpu()
         caption = (
@@ -109,7 +144,10 @@ def log_audio_to_wandb(
             pred, sample_rate=SAMPLE_RATE, caption=f"[predicted] {caption}",
         )
 
+    audio_logs["val/spectral_loss_preview"] = spec_loss
     wandb.log(audio_logs, step=epoch + 1)
+
+    return spec_loss
 
 
 # ---------------------------------------------------------------------------
@@ -205,18 +243,31 @@ def train_epoch_A(model, loader, optimizer, device):
 
 
 @torch.no_grad()
-def validate_A(model, loader, device):
+def validate_A(model, loader, device, synth=None, compute_spec=False):
+    """Validate Stage A.  Optionally renders audio and computes spectral loss."""
     model.eval()
-    total = 0.0
+    total_mse = 0.0
+    total_spec = 0.0
+    n_batches = 0
+
     for embeddings, target_params in loader:
         embeddings = embeddings.to(device)
         target_params = target_params.to(device)
         pred = model(embeddings)
-        loss = nn.functional.mse_loss(
+        total_mse += nn.functional.mse_loss(
             normalize_params(pred), normalize_params(target_params),
-        )
-        total += loss.item()
-    return total / len(loader)
+        ).item()
+
+        if compute_spec and synth is not None:
+            tgt_audio = synth.forward_batch(target_params).cpu()
+            pred_audio = synth.forward_batch(pred).cpu()
+            total_spec += compute_spectral_loss(tgt_audio, pred_audio).item()
+
+        n_batches += 1
+
+    avg_mse = total_mse / n_batches
+    avg_spec = total_spec / n_batches if compute_spec else None
+    return avg_mse, avg_spec
 
 
 def init_wandb(args, stage: str):
@@ -264,35 +315,47 @@ def run_stage_a(args):
     print(f"Stage A — param-space regression for {args.epochs} epochs")
     print(f"{'=' * 60}")
 
+    spec_interval = 5
+
     for epoch in range(args.epochs):
         t_loss = train_epoch_A(model, train_loader, optimizer, device)
-        v_loss = validate_A(model, val_loader, device)
+
+        # Full spectral val every spec_interval epochs (rendering is expensive)
+        do_spec = (epoch + 1) % spec_interval == 0 or epoch == 0
+        v_mse, v_spec = validate_A(
+            model, val_loader, device,
+            synth=synth_for_audio, compute_spec=do_spec,
+        )
         scheduler.step()
         lr = scheduler.get_last_lr()[0]
 
         is_best = False
-        if v_loss < best_val:
-            best_val = v_loss
+        if v_mse < best_val:
+            best_val = v_mse
             best_epoch = epoch
             is_best = True
             Path(output).parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), output)
 
+        spec_str = f"  spec={v_spec:.3f}" if v_spec is not None else ""
         print(
             f"Epoch {epoch+1:3d}/{args.epochs}  |  "
-            f"Train: {t_loss:.6f}  Val: {v_loss:.6f}  "
+            f"Train: {t_loss:.6f}  Val: {v_mse:.6f}{spec_str}  "
             f"LR={lr:.2e}{' ✓' if is_best else ''}"
         )
 
         if run:
-            wandb.log({
+            log_dict = {
                 "epoch": epoch + 1,
-                "train/loss": t_loss,
-                "val/loss": v_loss,
+                "train/param_loss": t_loss,
+                "val/param_loss": v_mse,
                 "lr": lr,
-                "best_val_loss": best_val,
-            })
-            # Log audio every 10 epochs or on new best
+                "best_val_param_loss": best_val,
+            }
+            if v_spec is not None:
+                log_dict["val/spectral_loss"] = v_spec
+            wandb.log(log_dict)
+
             if is_best or (epoch + 1) % 10 == 0:
                 log_audio_to_wandb(
                     model, synth_for_audio, val_loader, device, epoch,
