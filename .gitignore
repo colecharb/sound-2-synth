@@ -1,6 +1,7 @@
 .zed/
 .venv/
 __pycache__/
+.pip_cache/
 
 output.wav
 
