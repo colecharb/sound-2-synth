@@ -211,7 +211,7 @@ class FMSynth(nn.Module):
 
         # Batched filtering via FFT (replaces the per-sample conv1d loop)
         audio = self._apply_filters_batch_fft(
-            audio, lowpass_freq.detach(), highpass_freq.detach(),
+            audio, lowpass_freq, highpass_freq,
         )
 
         # Peak-normalise per sample
